@@ -79,6 +79,14 @@
 // Aproximacion de los colores tipicos de una cinta de 4 bandas (K/C/M/Y)
 // tal y como los seleccionaba el comando ESC r n de las Epson JX-80/LQ color.
 struct RGB { uint8_t r, g, b; };
+
+// Declarado aqui (y no junto a chooseFont()/drawChar() mas abajo) porque el
+// IDE de Arduino genera automaticamente los prototipos de las funciones y
+// los inserta al principio del fichero: si el struct se definiera despues,
+// esos prototipos no lo conocerian todavia y la compilacion fallaria con
+// "'FontChoice' does not name a type".
+struct FontChoice { const uint8_t *data; uint8_t cols; uint8_t rows; uint8_t firstChar; uint8_t lastChar; uint8_t baseScaleY; };
+struct GfxMode { uint8_t pins; uint16_t dpi; }; // ver el comentario de FontChoice: debe ir aqui, antes de cualquier funcion
 static const RGB PALETTE[8] = {
   {0,   0,   0  },  // 0 Negro
   {216, 0,   132},  // 1 Magenta
@@ -159,7 +167,6 @@ uint8_t  gfxMergeCount;    // columnas ya combinadas en el acumulador actual
 uint8_t  gfxMergeAccum[3]; // acumulador de la fusion (para modos >180dpi, p.ej. 360dpi)
 
 // Tabla de modos ESC * m -> {agujas, dpi_horizontal}
-struct GfxMode { uint8_t pins; uint16_t dpi; };
 GfxMode lookupStarMode(uint8_t m) {
   switch (m) {
     case 0:  return {8,  60};
@@ -344,8 +351,6 @@ uint16_t computeAdvanceDots() {
   if (advance < 4) advance = 4;
   return advance;
 }
-
-struct FontChoice { const uint8_t *data; uint8_t cols; uint8_t rows; uint8_t firstChar; uint8_t lastChar; uint8_t baseScaleY; };
 
 FontChoice chooseFont() {
   if (!lqMode) {
