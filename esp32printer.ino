@@ -25,14 +25,25 @@
  *   - No se implementa avance de papel hacia atras (no existe en ESC/P
  *     estandar salvo microjustificacion, que tampoco se soporta), por lo
  *     que la imagen se genera en una unica pasada, de arriba a abajo.
- *   - Solo se soporta un subconjunto practico de ESC/P: inicializacion,
+ *   - Se soporta un subconjunto practico de ESC/P: inicializacion,
  *     avance de linea/pagina, interlineado (ESC 2 / ESC 0 / ESC 3 n),
- *     graficos de puntos (ESC K/L/Y/Z y ESC *), negrita (ESC E/F),
- *     subrayado (ESC - n) y color de cinta (ESC r n). Los caracteres
- *     definidos por el usuario, tabulaciones verticales, microavances
- *     (ESC J), formato de pagina, etc. no estan implementados; los bytes
- *     de parametro de secuencias no reconocidas se descartan de forma
- *     conservadora para no desincronizar el interprete.
+ *     graficos de puntos (ESC K/L/Y/Z y ESC *), negrita/doble-golpe
+ *     (ESC E/F/G/H), subrayado (ESC - n), color de cinta (ESC r n),
+ *     tipo de letra (ESC k n), calidad borrador/NLQ (ESC x n), paso
+ *     pica/elite/15cpi (ESC P/M/g), condensado (SI/DC2), cursiva
+ *     (ESC 4/5), ancho doble (ESC W n) y super/subindice (ESC S/T).
+ *     Los caracteres definidos por el usuario, tabulaciones verticales,
+ *     microavances (ESC J), formato de pagina, doble ALTURA, etc. no
+ *     estan implementados; los bytes de parametro de secuencias no
+ *     reconocidas se descartan de forma conservadora para no
+ *     desincronizar el interprete.
+ *   - Los "tipos de letra" son una aproximacion honesta, no una copia
+ *     fiel: solo se dispone de dos fuentes de puntos de dominio publico
+ *     verificadas (una de 5x7 tipo palo seco y otra de 8x8 tipo
+ *     VGA/maquina de escribir). Las 7 tipografias de ESC k n se reparten
+ *     entre esas dos familias reales (ver drawChar()/chooseFont() para
+ *     el detalle exacto), y en modo borrador siempre se usa la de 5x7,
+ *     igual que hacian las impresoras reales.
  *   - La paleta de color es la tipica de cinta de 4 bandas de estas
  *     impresoras (Negro/Cian/Magenta/Amarillo + combinaciones), no un
  *     RGB continuo real.
@@ -44,6 +55,7 @@
 #include <SPI.h>
 #include <SD.h>
 #include "font5x7.h"
+#include "font8x8.h"
 
 // ================================ CONFIGURACION ===========================
 
@@ -94,6 +106,15 @@ uint8_t currentColor = 0;       // indice de PALETTE, por defecto negro
 bool boldMode = false;
 bool underlineMode = false;
 
+// --- Estado tipografico (ver seccion RENDERIZADO DE TEXTO para el detalle) ---
+uint8_t typefaceMode = 1;   // seleccionado por ESC k n (0 Roman,1 Sans Serif,2 Courier,3 Prestige,4 Script,5 OCR-B,6 OCR-A)
+bool    lqMode       = false; // ESC x n : false=borrador (draft), true=NLQ/calidad carta
+uint8_t pitchMode    = 0;    // ESC P/M/g : 0=pica(10cpi) 1=elite(12cpi) 2=15cpi
+bool    condensedMode = false; // SI (0x0F) / DC2 (0x12)
+bool    italicMode    = false; // ESC 4 / ESC 5
+bool    doubleWidthMode = false; // ESC W n
+uint8_t scriptMode    = 0;   // ESC S n / ESC T : 0=normal 1=superindice 2=subindice
+
 unsigned long lastByteMillis = 0;
 
 // --- Buffer de bandas: filas [bandBase .. bandBase+BAND_HEIGHT-1] en RAM ---
@@ -109,6 +130,10 @@ enum EscState {
   ST_ESC_R,        // ESC r n           (color de cinta)
   ST_ESC_3,        // ESC 3 n           (interlineado n/180")
   ST_ESC_MINUS,    // ESC - n           (subrayado on/off)
+  ST_ESC_K,        // ESC k n           (tipo de letra)
+  ST_ESC_X,        // ESC x n           (calidad borrador/NLQ)
+  ST_ESC_W,        // ESC W n           (ancho doble on/off)
+  ST_ESC_S,        // ESC S n           (superindice/subindice)
   ST_ESC_STAR_M,   // ESC * m ...       (grafico: falta el byte m)
   ST_ESC_STAR_NL,  // ESC * m nL ...
   ST_ESC_STAR_NH,  // ESC * m nL nH ... -> pasa a recibir datos
@@ -295,34 +320,81 @@ void finishPageIfNeeded() {
 }
 
 // ================================ RENDERIZADO DE TEXTO ======================
+//
+// NOTA IMPORTANTE sobre los "tipos de letra": una impresora matricial LQ real
+// tenia varias familias (Roman, Sans Serif, Courier, Prestige, Script,
+// OCR-A, OCR-B) con sus propios juegos de puntos internos. Aqui solo se
+// dispone de dos fuentes de puntos verificadas y de dominio publico: una de
+// 5x7 (aspecto de palo seco, "Sans Serif") y otra de 8x8 (aspecto mas denso,
+// tipo VGA/maquina de escribir). El comando ESC k n se interpreta y se
+// recuerda correctamente, pero las 7 tipografias se reparten entre estas
+// DOS familias reales como aproximacion visual, no como reproduccion fiel de
+// cada tipografia Epson original. En modo borrador (draft) se usa siempre la
+// fuente 5x7, tal y como hacian las propias impresoras (el modo borrador no
+// distinguia tipografias).
 
-#define CHAR_SCALE_X 2
-#define CHAR_SCALE_Y 3
-#define CHAR_ADVANCE ((FONT_COLS * CHAR_SCALE_X) + 2)
-#define CHAR_HEIGHT  (FONT_ROWS * CHAR_SCALE_Y)
+uint16_t computeAdvanceDots() {
+  float cpi;
+  if (condensedMode) cpi = (pitchMode == 1) ? 20.0f : 17.14f; // condensada elite / pica
+  else if (pitchMode == 0) cpi = 10.0f;   // pica
+  else if (pitchMode == 1) cpi = 12.0f;   // elite
+  else cpi = 15.0f;                       // ESC g
+  uint16_t advance = (uint16_t)((180.0f / cpi) + 0.5f);
+  if (doubleWidthMode) advance *= 2;
+  if (advance < 4) advance = 4;
+  return advance;
+}
+
+struct FontChoice { const uint8_t *data; uint8_t cols; uint8_t rows; uint8_t firstChar; uint8_t lastChar; uint8_t baseScaleY; };
+
+FontChoice chooseFont() {
+  if (!lqMode) {
+    return { font5x7, FONT_COLS, FONT_ROWS, FONT_FIRST_CHAR, FONT_LAST_CHAR, 3 };
+  }
+  switch (typefaceMode) {
+    case 1: // Sans Serif
+      return { font5x7, FONT_COLS, FONT_ROWS, FONT_FIRST_CHAR, FONT_LAST_CHAR, 3 };
+    default: // Roman, Courier, Prestige, Script, OCR-B, OCR-A -> familia de 8x8
+      return { font8x8, FONT2_COLS, FONT2_ROWS, FONT2_FIRST_CHAR, FONT2_LAST_CHAR, 2 };
+  }
+}
 
 void drawChar(uint8_t c) {
-  if (c < FONT_FIRST_CHAR || c > FONT_LAST_CHAR) c = ' ';
-  const uint8_t *glyph = &font5x7[(c - FONT_FIRST_CHAR) * FONT_COLS];
+  FontChoice fc = chooseFont();
+  if (c < fc.firstChar || c > fc.lastChar) c = ' ';
+  const uint8_t *glyph = fc.data + (uint32_t)(c - fc.firstChar) * fc.cols;
 
-  for (int col = 0; col < FONT_COLS; col++) {
+  uint16_t advance = computeAdvanceDots();
+  uint16_t usable = (advance > 2) ? (advance - 2) : advance;
+  uint8_t scaleX = usable / fc.cols;
+  if (scaleX < 1) scaleX = 1;
+
+  uint8_t scaleY = fc.baseScaleY;
+  if (scriptMode != 0) { scaleY = (uint8_t)((scaleY * 2) / 3); if (scaleY < 1) scaleY = 1; }
+
+  uint16_t fullHeight = fc.rows * fc.baseScaleY;   // alto normal (sin super/subindice)
+  uint16_t thisHeight = fc.rows * scaleY;
+  int32_t yBase = cursorY;
+  if (scriptMode == 2) yBase = cursorY + (fullHeight - thisHeight); // subindice: alineado abajo
+
+  for (int col = 0; col < fc.cols; col++) {
     uint8_t colBits = pgm_read_byte(&glyph[col]);
-    for (int row = 0; row < FONT_ROWS; row++) {
-      if (colBits & (1 << row)) {
-        for (int sy = 0; sy < CHAR_SCALE_Y; sy++) {
-          for (int sx = 0; sx < CHAR_SCALE_X; sx++) {
-            int32_t x = cursorX + col * CHAR_SCALE_X + sx;
-            int32_t y = cursorY + row * CHAR_SCALE_Y + sy;
-            plotDot(x, y, currentColor);
-            if (boldMode) plotDot(x + 1, y, currentColor); // negrita: doble golpe desplazado
-          }
+    for (int row = 0; row < fc.rows; row++) {
+      if (!(colBits & (1 << row))) continue;
+      int8_t xShear = italicMode ? (int8_t)((fc.rows - 1 - row) / 2) : 0;
+      for (int sy = 0; sy < scaleY; sy++) {
+        for (int sx = 0; sx < scaleX; sx++) {
+          int32_t x = cursorX + col * scaleX + sx + xShear;
+          int32_t y = yBase + row * scaleY + sy;
+          plotDot(x, y, currentColor);
+          if (boldMode) plotDot(x + 1, y, currentColor); // negrita: doble golpe desplazado
         }
       }
     }
   }
   if (underlineMode) {
-    int32_t y = cursorY + CHAR_HEIGHT - 1;
-    for (int x = 0; x < CHAR_ADVANCE; x++) plotDot(cursorX + x, y, currentColor);
+    int32_t y = cursorY + fullHeight - 1; // el subrayado siempre va en la linea base normal
+    for (int x = 0; x < advance; x++) plotDot(cursorX + x, y, currentColor);
   }
 }
 
@@ -335,6 +407,13 @@ void resetPrinterState() {
   lineSpacingDots = DEFAULT_LINE_DOTS;
   cursorX = 0;
   cursorY = 0;
+  typefaceMode = 1;
+  lqMode = false;
+  pitchMode = 0;
+  condensedMode = false;
+  italicMode = false;
+  doubleWidthMode = false;
+  scriptMode = 0;
 }
 
 void startGraphicsCapture(uint8_t pins, uint16_t dpi) {
@@ -416,20 +495,26 @@ void handleByte(uint8_t b) {
           finishPageIfNeeded();
           return;
         case 0x08: // BS
-          cursorX -= CHAR_ADVANCE;
+          cursorX -= computeAdvanceDots();
           if (cursorX < 0) cursorX = 0;
           return;
         case 0x09: { // HT: tabulador cada 8 celdas de caracter
-          int32_t cell = CHAR_ADVANCE * 8;
+          int32_t cell = computeAdvanceDots() * 8;
           cursorX = ((cursorX / cell) + 1) * cell;
           return;
         }
+        case 0x0F: // SI: activa condensado (tambien existe como ESC SI)
+          condensedMode = true;
+          return;
+        case 0x12: // DC2: cancela condensado
+          condensedMode = false;
+          return;
         case 0x00: case 0x07: // NUL, BEL: se ignoran
           return;
         default:
           if (b >= 0x20 && b <= 0x7E) {
             drawChar(b);
-            cursorX += CHAR_ADVANCE;
+            cursorX += computeAdvanceDots();
           }
           // bytes >= 0x80 (juegos de caracteres extendidos/acentos) no
           // soportados: se ignoran de forma segura en vez de imprimir basura.
@@ -444,6 +529,8 @@ void handleByte(uint8_t b) {
         case '3': escState = ST_ESC_3; return;                            // ESC 3 n
         case 'E': boldMode = true;  escState = ST_NORMAL; return;         // negrita ON
         case 'F': boldMode = false; escState = ST_NORMAL; return;         // negrita OFF
+        case 'G': boldMode = true;  escState = ST_NORMAL; return;         // doble golpe ON (se trata como negrita, ver limitaciones)
+        case 'H': boldMode = false; escState = ST_NORMAL; return;         // doble golpe OFF
         case 'r': escState = ST_ESC_R; return;                            // color de cinta
         case '-': escState = ST_ESC_MINUS; return;                       // subrayado
         case '*': escState = ST_ESC_STAR_M; return;                      // grafico ESC *
@@ -451,6 +538,18 @@ void handleByte(uint8_t b) {
         case 'L': startGraphicsCapture(8, 120); escState = ST_ESC_KLYZ_NL; return;
         case 'Y': startGraphicsCapture(8, 120); escState = ST_ESC_KLYZ_NL; return;
         case 'Z': startGraphicsCapture(8, 240); escState = ST_ESC_KLYZ_NL; return;
+        case 'k': escState = ST_ESC_K; return;                            // ESC k n: tipo de letra
+        case 'x': escState = ST_ESC_X; return;                            // ESC x n: borrador/NLQ
+        case 'P': pitchMode = 0; escState = ST_NORMAL; return;            // pica (10 cpi)
+        case 'M': pitchMode = 1; escState = ST_NORMAL; return;            // elite (12 cpi)
+        case 'g': pitchMode = 2; escState = ST_NORMAL; return;            // 15 cpi
+        case 0x0F: condensedMode = true;  escState = ST_NORMAL; return;   // ESC SI: condensado ON
+        case 0x12: condensedMode = false; escState = ST_NORMAL; return;   // cancelar condensado
+        case 'W': escState = ST_ESC_W; return;                            // ESC W n: ancho doble
+        case '4': italicMode = true;  escState = ST_NORMAL; return;       // cursiva ON
+        case '5': italicMode = false; escState = ST_NORMAL; return;       // cursiva OFF
+        case 'S': escState = ST_ESC_S; return;                            // ESC S n: super/subindice
+        case 'T': scriptMode = 0; escState = ST_NORMAL; return;           // cancela super/subindice
         default:
           // Comando ESC/P no soportado: se descarta un unico byte de posible
           // parametro para intentar no desincronizar el resto del flujo.
@@ -474,6 +573,26 @@ void handleByte(uint8_t b) {
 
     case ST_ESC_MINUS:
       underlineMode = (b != 0);
+      escState = ST_NORMAL;
+      return;
+
+    case ST_ESC_K:
+      typefaceMode = (b <= 6) ? b : 0;
+      escState = ST_NORMAL;
+      return;
+
+    case ST_ESC_X:
+      lqMode = (b != 0);
+      escState = ST_NORMAL;
+      return;
+
+    case ST_ESC_W:
+      doubleWidthMode = (b != 0);
+      escState = ST_NORMAL;
+      return;
+
+    case ST_ESC_S:
+      scriptMode = (b == 0) ? 1 : 2; // 0=superindice, 1=subindice (segun ESC/P)
       escState = ST_NORMAL;
       return;
 
