@@ -59,15 +59,21 @@
 
 // ================================ CONFIGURACION ===========================
 
-// --- Tarjeta SD (SPI) ---
-#define SD_CS_PIN     5      // Chip Select de la SD
-// Si se usan pines SPI no estandar, llamar antes a SPI.begin(SCK,MISO,MOSI,CS)
+// --- Tarjeta SD (SPI) --- (pines para ESP32-S3; el S3 no tiene un mapeo
+// VSPI/HSPI fijo como el ESP32 clasico, asi que hay que indicarlos a mano)
+#define SD_CS_PIN     10     // Chip Select de la SD
+#define SD_MOSI_PIN   11
+#define SD_SCK_PIN    12
+#define SD_MISO_PIN   13
 
 // --- Puerto serie hacia el MAX232 (Serial2 = UART2 del ESP32) ---
-#define SERIAL_RX_PIN 16
 #define SERIAL_TX_PIN 17
-#define SERIAL_BAUD   9600   // Velocidad tipica de impresora serie de la epoca
-#define USE_XONXOFF   true   // Control de flujo por software (recomendado)
+#define SERIAL_RX_PIN 18
+#define SERIAL_RTS_PIN 15   // RTS de salida: avisa al host cuando NO debe seguir enviando
+#define SERIAL_CTS_PIN 16   // CTS de entrada: el host nos dice cuando puede recibir (no usado al imprimir)
+#define SERIAL_BAUD   2400   // Velocidad del puerto serie de la impresora
+#define USE_HW_FLOW_CONTROL true  // Control de flujo por hardware RTS/CTS (preferido: hay pines cableados)
+#define USE_XONXOFF   false  // Control de flujo por software (alternativa si no se cablean RTS/CTS)
 
 // --- Geometria de la pagina virtual (rejilla interna a 180 dpi) ---
 #define PAGE_WIDTH_DOTS   1440   // 1440/180 = 8.0 pulgadas de ancho de impresion
@@ -228,8 +234,20 @@ uint32_t rowSizeBytes() {
 }
 
 void openNewPage() {
-  pageIndex++;
-  snprintf(currentFileName, sizeof(currentFileName), "/PAGE%04lu.BMP", (unsigned long)pageIndex);
+  // pageIndex es un contador en RAM que arranca de 0 en cada reinicio del
+  // ESP32, pero los ficheros de sesiones anteriores siguen en la SD. Para no
+  // sobrescribirlos, se busca el primer nombre libre a partir de pageIndex+1.
+  do {
+    pageIndex++;
+    snprintf(currentFileName, sizeof(currentFileName), "/PAGE%04lu.BMP", (unsigned long)pageIndex);
+  } while (SD.exists(currentFileName) && pageIndex < 9999);
+
+  if (SD.exists(currentFileName)) {
+    // No deberia ocurrir salvo que la SD ya tenga las 9999 paginas usadas.
+    Serial.println("[ERROR] No se encontro un nombre de pagina libre (PAGE0001..PAGE9999.BMP agotados).");
+    pageOpen = false;
+    return;
+  }
   pageFile = SD.open(currentFileName, FILE_WRITE);
   if (!pageFile) {
     Serial.printf("[ERROR] No se pudo crear %s en la SD\n", currentFileName);
@@ -656,6 +674,9 @@ void setup() {
   delay(200);
   Serial.println("\n[INFO] Emulador de impresora Epson LQ 24 agujas color - iniciando...");
 
+  // El ESP32-S3 no tiene un mapeo VSPI/HSPI fijo: hay que indicar los pines
+  // explicitamente antes de montar la SD.
+  SPI.begin(SD_SCK_PIN, SD_MISO_PIN, SD_MOSI_PIN, SD_CS_PIN);
   if (!SD.begin(SD_CS_PIN)) {
     Serial.println("[ERROR] No se pudo montar la tarjeta SD. Revisa el cableado/CS.");
   } else {
@@ -663,7 +684,20 @@ void setup() {
   }
 
   Serial2.setRxBufferSize(2048); // margen extra frente a rafagas mientras se escribe en la SD
+  if (USE_HW_FLOW_CONTROL) {
+    // setPins() debe llamarse antes de begin(); cts=SERIAL_CTS_PIN (entrada,
+    // lo que nos dice el host), rts=SERIAL_RTS_PIN (salida, lo que nosotros
+    // le decimos al host).
+    Serial2.setPins(SERIAL_RX_PIN, SERIAL_TX_PIN, SERIAL_CTS_PIN, SERIAL_RTS_PIN);
+  }
   Serial2.begin(SERIAL_BAUD, SERIAL_8N1, SERIAL_RX_PIN, SERIAL_TX_PIN);
+  if (USE_HW_FLOW_CONTROL) {
+    // El propio driver de UART baja RTS automaticamente cuando el buffer de
+    // recepcion se llena por encima del umbral, y lo sube cuando hay hueco:
+    // asi el host deja de enviar mientras escribimos en la SD, sin que
+    // nuestro codigo tenga que gestionarlo a mano (a diferencia del XON/XOFF).
+    Serial2.setHwFlowCtrlMode(UART_HW_FLOWCTRL_CTS_RTS, 64);
+  }
 
   memset(band, COLOR_WHITE_INDEX, sizeof(band));
   resetPrinterState();
