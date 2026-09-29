@@ -19,6 +19,13 @@
  *
  * ---------------------------------------------------------------------
  * LIMITACIONES CONOCIDAS (documentadas para no llevar a confusion):
+ *   - La hoja tiene una altura FIJA (PAGE_HEIGHT_DOTS, por defecto 2043
+ *     puntos ~ hoja A4 a 180dpi): un Form Feed a mitad de hoja rellena de
+ *     blanco lo que falte, y si el contenido llega al final sin recibir
+ *     Form Feed, la pagina se cierra sola (igual que con un Form Feed) y
+ *     se abre una nueva automaticamente. Esto implica que TODOS los BMP
+ *     generados pesan lo mismo (PAGE_WIDTH_DOTS x PAGE_HEIGHT_DOTS, sin
+ *     comprimir) independientemente de cuanto se haya impreso realmente.
  *   - Resolucion interna fija a 180 dpi tanto en horizontal como en
  *     vertical. Los modos de 360 dpi (ESC * m=40/72) se aceptan pero se
  *     "diezman" a 180 dpi (se descarta una columna de cada dos).
@@ -54,6 +61,7 @@
 
 #include <SPI.h>
 #include <SD.h>
+#include <Adafruit_NeoPixel.h> // Libreria "Adafruit NeoPixel" (instalar desde el Gestor de Librerias si falta)
 #include "font5x7.h"
 #include "font8x8.h"
 
@@ -77,9 +85,46 @@
 
 // --- Geometria de la pagina virtual (rejilla interna a 180 dpi) ---
 #define PAGE_WIDTH_DOTS   1440   // 1440/180 = 8.0 pulgadas de ancho de impresion
+#define PAGE_HEIGHT_DOTS  2043   // Alto FIJO de cada pagina (aprox. una hoja A4 a 180dpi).
+                                  // Cada BMP generado mide siempre PAGE_WIDTH_DOTS x
+                                  // PAGE_HEIGHT_DOTS: un Form Feed (o el cierre automatico
+                                  // al llegar al final de la hoja) rellena de blanco lo que
+                                  // falte, y si el contenido llega a esta altura sin recibir
+                                  // Form Feed, la pagina se cierra sola y se abre una nueva.
 #define BAND_HEIGHT       48     // Alto del buffer de bandas en filas (RAM ~ 1440*48 bytes)
 #define DEFAULT_LINE_DOTS 30     // 1/6" a 180dpi = 30 puntos (interlineado por defecto)
-#define IDLE_TIMEOUT_MS   3000   // Si no llega nada en este tiempo, se cierra la pagina sola
+
+// Equivalente por software a los DIP-switch "Auto LF" / "Auto CR" de una
+// Epson real. Muchos ordenadores antiguos solo mandan CR (0x0D) al final de
+// linea y esperan que la propia impresora añada el salto de linea (o al
+// reves: solo mandan LF esperando que la impresora vuelva al margen). Si al
+// imprimir el papel no avanza (todo se solapa en la misma linea), prueba a
+// poner AUTO_LF_ON_CR en true; si en cambio el texto no vuelve al margen
+// izquierdo entre lineas, prueba AUTO_CR_ON_LF.
+#define AUTO_LF_ON_CR  false  // CR (0x0D) tambien hace un salto de linea
+#define AUTO_CR_ON_LF  true   // LF (0x0A) tambien vuelve al margen izquierdo
+#define IDLE_TIMEOUT_MS   600000UL  // 10 minutos. millis() es un unsigned long de 32 bits
+                                     // (desborda a los ~49.7 dias), asi que 10 minutos caben
+                                     // de sobra sin ningun problema; no hace falta recortarlo.
+
+// --- Boton de cierre manual de pagina ---
+// Boton con pull-up EXTERNO a la patilla 46 (no se usa INPUT_PULLUP porque
+// hay resistencia externa): en reposo la patilla esta en HIGH y al pulsar
+// el boton la lleva a GND (LOW).
+#define BUTTON_PIN         46
+#define BUTTON_DEBOUNCE_MS 50
+
+// --- LED RGB de estado ---
+// LED direccionable (tipo WS2812/NeoPixel, un solo pin de datos) en la
+// patilla 47. Colores: verde = sin pagina empezada, azul = pagina
+// empezada (en espera), morado = recibiendo datos por el puerto serie,
+// amarillo = destello breve al pulsar el boton de cierre (Form Feed
+// manual), rojo = problema con la tarjeta SD.
+#define RGB_LED_PIN        48
+#define RGB_LED_BRIGHTNESS 0.15f  // 15% en los 3 colores
+#define RECEIVING_HOLD_MS  150UL  // cuanto se mantiene "morado" tras el ultimo byte recibido
+#define BUTTON_FLASH_MS    400UL  // duracion del destello amarillo al pulsar el boton
+#define SD_RETRY_INTERVAL_MS 5000UL // cada cuanto se reintenta remontar la SD si fallo
 
 // ================================ PALETA DE COLOR ==========================
 // Aproximacion de los colores tipicos de una cinta de 4 bandas (K/C/M/Y)
@@ -93,6 +138,13 @@ struct RGB { uint8_t r, g, b; };
 // "'FontChoice' does not name a type".
 struct FontChoice { const uint8_t *data; uint8_t cols; uint8_t rows; uint8_t firstChar; uint8_t lastChar; uint8_t baseScaleY; };
 struct GfxMode { uint8_t pins; uint16_t dpi; }; // ver el comentario de FontChoice: debe ir aqui, antes de cualquier funcion
+
+// Declaraciones adelantadas: el codigo de escritura en SD (mas abajo) necesita
+// avisar al LED en el momento exacto en que empieza/termina a escribir, pero
+// las funciones del LED estan definidas mas adelante en el fichero.
+void sdWriteBegin();
+void sdWriteEnd();
+void updateStatusLed();
 static const RGB PALETTE[8] = {
   {0,   0,   0  },  // 0 Negro
   {216, 0,   132},  // 1 Magenta
@@ -130,6 +182,17 @@ bool    doubleWidthMode = false; // ESC W n
 uint8_t scriptMode    = 0;   // ESC S n / ESC T : 0=normal 1=superindice 2=subindice
 
 unsigned long lastByteMillis = 0;
+bool everReceivedByte = false;  // evita que el LED muestre "recibiendo" antes del primer byte real
+
+bool sdOk = true;               // false si el montaje inicial o la apertura de un fichero fallan
+unsigned long lastSdRetryMillis = 0;
+bool writingToSD = false;       // true mientras hay una escritura fisica en curso en la SD
+
+bool buttonFlashActive = false;
+unsigned long buttonFlashStartMillis = 0;
+
+Adafruit_NeoPixel rgbLed(1, RGB_LED_PIN, NEO_GRB + NEO_KHZ800);
+uint32_t lastLedColorSet = 0xFFFFFFFF; // sentinela invalido para forzar el primer show()
 
 // --- Buffer de bandas: filas [bandBase .. bandBase+BAND_HEIGHT-1] en RAM ---
 // band[y % BAND_HEIGHT][x] = indice de color (0..6) o COLOR_WHITE_INDEX si vacio
@@ -199,15 +262,18 @@ void flushOneRow(); // declaracion adelantada (definida junto al resto de manejo
 void ensureBandCovers(int32_t y) {
   // Si la fila y ya no cabe en la ventana actual del buffer, volcamos a la SD
   // las filas mas antiguas hasta que quepa.
+  if (y < bandBase + BAND_HEIGHT) return; // caso normal: no hace falta escribir nada
+  sdWriteBegin();
   while (y >= bandBase + BAND_HEIGHT) {
     flushOneRow();
   }
+  sdWriteEnd();
 }
 
 int32_t maxYUsed = -1; // fila mas baja en la que se ha pintado algo desde que se abrio la pagina
 
 void plotDot(int32_t x, int32_t y, uint8_t colorIndex) {
-  if (x < 0 || x >= PAGE_WIDTH_DOTS || y < 0) return;
+  if (x < 0 || x >= PAGE_WIDTH_DOTS || y < 0 || y >= PAGE_HEIGHT_DOTS) return;
   ensureBandCovers(y);
   if (y < bandBase) return; // fila ya volcada a la SD (no deberia ocurrir con avance monotono)
   int32_t rel = y % BAND_HEIGHT; // buffer en anillo: mismo indexado que usa flushOneRow()
@@ -252,9 +318,12 @@ void openNewPage() {
   if (!pageFile) {
     Serial.printf("[ERROR] No se pudo crear %s en la SD\n", currentFileName);
     pageOpen = false;
+    sdOk = false;
+    updateStatusLed(); // reflejar el fallo de inmediato, sin esperar al loop()
     return;
   }
 
+  sdWriteBegin();
   // --- Cabecera BMP (54 bytes), con alto y tamano en 0 como marcador ---
   pageFile.write((const uint8_t*)"BM", 2);
   writeLE32(pageFile, 0);           // tamano de fichero (se rellena al cerrar)
@@ -271,6 +340,7 @@ void openNewPage() {
   writeLE32(pageFile, 2834);        // resolucion Y ~ 180dpi en pixeles/metro
   writeLE32(pageFile, 0);           // colores en la paleta
   writeLE32(pageFile, 0);           // colores importantes
+  sdWriteEnd();
 
   bandBase = 0;
   cursorX = 0;
@@ -312,11 +382,14 @@ void closePage() {
 
   if (USE_XONXOFF) Serial2.write((uint8_t)0x13); // XOFF: puede tardar en escribir en SD
 
-  // Volcar todo lo que quede en el buffer, hasta la ultima fila donde se pinto tinta
-  // (no basta con cursorY: un caracter dibujado en la ultima linea ocupa varias
-  // filas por debajo de la posicion del cursor).
-  int32_t targetTop = max(maxYUsed + 1, bandBase);
-  while (bandBase < targetTop) flushOneRow();
+  sdWriteBegin();
+
+  // Volcar todo lo que quede en el buffer y, ademas, rellenar de blanco el
+  // resto de la hoja hasta la altura fija PAGE_HEIGHT_DOTS: asi todas las
+  // paginas generadas miden siempre lo mismo (aspecto de hoja A4), tanto si
+  // el cierre lo provoca un Form Feed a mitad de hoja como si lo provoca
+  // haber llegado justo al final.
+  while (bandBase < PAGE_HEIGHT_DOTS) flushOneRow();
 
   // Corregir cabecera con el alto real (negativo = orden top-down) y el tamano
   uint32_t rs = rowSizeBytes();
@@ -325,7 +398,11 @@ void closePage() {
   writeLE32(pageFile, fileSize);
   pageFile.seek(22);
   writeLE32(pageFile, (uint32_t)(-(int32_t)rowsWrittenToFile)); // alto negativo = top-down
+  pageFile.flush(); // fuerza la escritura fisica en la SD (close() ya lo hace, pero
+                     // se deja explicito: es el ultimo dato critico, la cabecera)
   pageFile.close();
+
+  sdWriteEnd();
 
   Serial.printf("[INFO] Pagina cerrada: %s (%lu filas)\n", currentFileName, (unsigned long)rowsWrittenToFile);
   pageOpen = false;
@@ -497,8 +574,21 @@ void plotGraphicsColumn() {
   }
 }
 
-void handleByte(uint8_t b) {
+// Muchos programas y sistemas antiguos no mandan los parametros de tipo
+// "on/off" o de enumeracion pequena (0-9) como el valor binario crudo, sino
+// como el digito ASCII correspondiente ('0'-'9' = 0x30-0x39), o incluso con
+// el bit 7 puesto (0xB0-0xB9), algo habitual en algunos ordenadores de 8
+// bits. Se aceptan las tres formas indistintamente: 0x00/0x30/0xB0 -> 0,
+// 0x01/0x31/0xB1 -> 1, etc.
+uint8_t decodeNumericParam(uint8_t b) {
+  if (b >= 0x30 && b <= 0x39) return b - 0x30; // digito ASCII ('0'-'9')
+  if (b >= 0xB0 && b <= 0xB9) return b - 0xB0; // digito ASCII con el bit 7 puesto
+  return b;                                    // valor binario crudo
+}
+
+void handleByteInner(uint8_t b) {
   lastByteMillis = millis();
+  everReceivedByte = true;
 
   // Si no hay pagina abierta, se abre de forma perezosa en cuanto llega algo
   if (!pageOpen) openNewPage();
@@ -510,9 +600,11 @@ void handleByte(uint8_t b) {
       switch (b) {
         case 0x0A: // LF
           cursorY += lineSpacingDots;
+          if (AUTO_CR_ON_LF) cursorX = 0;
           return;
         case 0x0D: // CR
           cursorX = 0;
+          if (AUTO_LF_ON_CR) cursorY += lineSpacingDots;
           return;
         case 0x0C: // FF
           finishPageIfNeeded();
@@ -585,7 +677,7 @@ void handleByte(uint8_t b) {
       return;
 
     case ST_ESC_R:
-      currentColor = (b <= 6) ? b : 0;
+      currentColor = (decodeNumericParam(b) <= 6) ? decodeNumericParam(b) : 0;
       escState = ST_NORMAL;
       return;
 
@@ -595,27 +687,27 @@ void handleByte(uint8_t b) {
       return;
 
     case ST_ESC_MINUS:
-      underlineMode = (b != 0);
+      underlineMode = (decodeNumericParam(b) != 0);
       escState = ST_NORMAL;
       return;
 
     case ST_ESC_K:
-      typefaceMode = (b <= 6) ? b : 0;
+      { uint8_t v = decodeNumericParam(b); typefaceMode = (v <= 6) ? v : 0; }
       escState = ST_NORMAL;
       return;
 
     case ST_ESC_X:
-      lqMode = (b != 0);
+      lqMode = (decodeNumericParam(b) != 0);
       escState = ST_NORMAL;
       return;
 
     case ST_ESC_W:
-      doubleWidthMode = (b != 0);
+      doubleWidthMode = (decodeNumericParam(b) != 0);
       escState = ST_NORMAL;
       return;
 
     case ST_ESC_S:
-      scriptMode = (b == 0) ? 1 : 2; // 0=superindice, 1=subindice (segun ESC/P)
+      scriptMode = (decodeNumericParam(b) == 0) ? 1 : 2; // 0=superindice, 1=subindice (segun ESC/P)
       escState = ST_NORMAL;
       return;
 
@@ -667,6 +759,82 @@ void handleByte(uint8_t b) {
   }
 }
 
+void handleByte(uint8_t b) {
+  handleByteInner(b);
+  // Si el cursor ha llegado (o se ha pasado) del final de la hoja fija sin
+  // que haya llegado un Form Feed, cerramos la pagina igualmente (rellenada
+  // de blanco hasta PAGE_HEIGHT_DOTS por closePage()) y dejamos que el
+  // siguiente byte abra una pagina nueva de forma perezosa, tal y como ya
+  // hace el resto del codigo tras un Form Feed o el boton de cierre.
+  if (pageOpen && cursorY >= PAGE_HEIGHT_DOTS) {
+    Serial.println("[INFO] Fin de hoja alcanzado: cerrando pagina automaticamente.");
+    finishPageIfNeeded();
+  }
+}
+
+// ================================ BOTON DE CIERRE MANUAL =====================
+
+bool buttonLastReading = HIGH;
+bool buttonStableState = HIGH;
+unsigned long buttonLastChangeMillis = 0;
+
+void checkCloseButton() {
+  bool reading = digitalRead(BUTTON_PIN);
+  if (reading != buttonLastReading) {
+    buttonLastChangeMillis = millis();
+    buttonLastReading = reading;
+  }
+  if ((millis() - buttonLastChangeMillis) > BUTTON_DEBOUNCE_MS && reading != buttonStableState) {
+    buttonStableState = reading;
+    if (buttonStableState == LOW) { // flanco de bajada = boton pulsado (pull-up externo)
+      Serial.println("[INFO] Boton pulsado: cerrando pagina manualmente.");
+      finishPageIfNeeded();
+      buttonFlashActive = true;
+      buttonFlashStartMillis = millis();
+      updateStatusLed(); // mostrar el amarillo ya, sin esperar a la siguiente vuelta de loop()
+    }
+  }
+}
+
+// ================================ LED RGB DE ESTADO =========================
+
+void updateStatusLed(); // adelantada: sdWriteBegin/End la llaman para reflejar el cambio al instante
+
+void sdWriteBegin() {
+  writingToSD = true;
+  updateStatusLed(); // cambia el LED YA, sin esperar a la siguiente vuelta de loop()
+}
+void sdWriteEnd() {
+  writingToSD = false;
+  updateStatusLed();
+}
+
+uint32_t ledColor(uint8_t r, uint8_t g, uint8_t b) {
+  return rgbLed.Color(r, g, b); // el brillo lo aplica rgbLed.setBrightness() (ver setup()), no aqui
+}
+
+uint32_t computeLedColor() {
+  if (!sdOk)                                   return ledColor(255, 0,   0);   // rojo: problema con la SD
+  if (buttonFlashActive)                       return ledColor(255, 255, 0);   // amarillo: boton pulsado
+  if (writingToSD)                             return ledColor(0,   180, 255); // celeste: escribiendo en la SD
+  if (everReceivedByte && (millis() - lastByteMillis) < RECEIVING_HOLD_MS)
+                                                return ledColor(160, 32, 240);  // morado: recibiendo datos
+  if (pageOpen)                                return ledColor(0,   0,   255); // azul: pagina empezada
+  return ledColor(0, 255, 0);                                                  // verde: sin pagina empezada
+}
+
+void updateStatusLed() {
+  if (buttonFlashActive && (millis() - buttonFlashStartMillis >= BUTTON_FLASH_MS)) {
+    buttonFlashActive = false;
+  }
+  uint32_t c = computeLedColor();
+  if (c != lastLedColorSet) {
+    rgbLed.setPixelColor(0, c);
+    rgbLed.show();
+    lastLedColorSet = c;
+  }
+}
+
 // ================================ ARDUINO SETUP / LOOP ======================
 
 void setup() {
@@ -674,20 +842,33 @@ void setup() {
   delay(200);
   Serial.println("\n[INFO] Emulador de impresora Epson LQ 24 agujas color - iniciando...");
 
+  rgbLed.begin();
+  rgbLed.setBrightness((uint8_t)(RGB_LED_BRIGHTNESS * 255.0f + 0.5f)); // brillo real de la libreria (antes no se ajustaba)
+  rgbLed.setPixelColor(0, ledColor(0, 255, 0)); // verde por defecto (sin pagina) mientras arranca
+  rgbLed.show();
+
   // El ESP32-S3 no tiene un mapeo VSPI/HSPI fijo: hay que indicar los pines
   // explicitamente antes de montar la SD.
   SPI.begin(SD_SCK_PIN, SD_MISO_PIN, SD_MOSI_PIN, SD_CS_PIN);
   if (!SD.begin(SD_CS_PIN)) {
     Serial.println("[ERROR] No se pudo montar la tarjeta SD. Revisa el cableado/CS.");
+    sdOk = false;
   } else {
     Serial.println("[INFO] Tarjeta SD montada correctamente.");
+    sdOk = true;
   }
+  updateStatusLed(); // reflejar el resultado del montaje de inmediato
 
   Serial2.setRxBufferSize(2048); // margen extra frente a rafagas mientras se escribe en la SD
   if (USE_HW_FLOW_CONTROL) {
-    // setPins() debe llamarse antes de begin(); cts=SERIAL_CTS_PIN (entrada,
-    // lo que nos dice el host), rts=SERIAL_RTS_PIN (salida, lo que nosotros
-    // le decimos al host).
+    // OJO: esto NO es lo que fija RX/TX -- eso lo hace siempre Serial2.begin()
+    // un poco mas abajo (recibe RX/TX como parametros y los configura tanto
+    // si hay control de flujo como si no). setPins() aqui sirve UNICAMENTE
+    // para añadir los pines CTS/RTS antes de begin(), que es el unico sitio
+    // donde se pueden indicar (el begin() de 5 parametros que usamos no
+    // acepta CTS/RTS directamente). Por eso esta en un if: si no se usa
+    // control de flujo por hardware, simplemente no se tocan esos dos pines
+    // y el puerto serie funciona igual de bien solo con RX/TX.
     Serial2.setPins(SERIAL_RX_PIN, SERIAL_TX_PIN, SERIAL_CTS_PIN, SERIAL_RTS_PIN);
   }
   Serial2.begin(SERIAL_BAUD, SERIAL_8N1, SERIAL_RX_PIN, SERIAL_TX_PIN);
@@ -703,6 +884,10 @@ void setup() {
   resetPrinterState();
   lastByteMillis = millis();
 
+  pinMode(BUTTON_PIN, INPUT); // pull-up externo ya presente en la placa; no usar INPUT_PULLUP
+  buttonLastReading = digitalRead(BUTTON_PIN);
+  buttonStableState = buttonLastReading;
+
   Serial.println("[INFO] Esperando datos por el puerto serie (impresora)...");
 }
 
@@ -712,10 +897,27 @@ void loop() {
     handleByte(b);
   }
 
+  checkCloseButton();
+
+  // Si la SD fallo (al arrancar o al abrir un fichero), reintentar montarla
+  // de vez en cuando en vez de quedarse en rojo para siempre.
+  if (!sdOk && (millis() - lastSdRetryMillis > SD_RETRY_INTERVAL_MS)) {
+    lastSdRetryMillis = millis();
+    Serial.println("[INFO] Reintentando montar la tarjeta SD...");
+    SD.end();
+    if (SD.begin(SD_CS_PIN)) {
+      Serial.println("[INFO] Tarjeta SD recuperada.");
+      sdOk = true;
+      updateStatusLed(); // reflejar la recuperacion de inmediato, sin esperar a la siguiente vuelta
+    }
+  }
+
   // Si llevamos un rato sin recibir nada y hay una pagina con contenido sin
   // cerrar (el host no envio Form Feed final), la cerramos igualmente.
   if (pageOpen && pageHasInk && (millis() - lastByteMillis > IDLE_TIMEOUT_MS)) {
     Serial.println("[INFO] Sin actividad: cerrando pagina automaticamente.");
     finishPageIfNeeded();
   }
+
+  updateStatusLed();
 }
