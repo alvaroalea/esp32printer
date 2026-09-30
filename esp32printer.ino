@@ -145,6 +145,7 @@ struct GfxMode { uint8_t pins; uint16_t dpi; }; // ver el comentario de FontChoi
 void sdWriteBegin();
 void sdWriteEnd();
 void updateStatusLed();
+void patchHeaderNow();
 static const RGB PALETTE[8] = {
   {0,   0,   0  },  // 0 Negro
   {216, 0,   132},  // 1 Magenta
@@ -267,6 +268,7 @@ void ensureBandCovers(int32_t y) {
   while (y >= bandBase + BAND_HEIGHT) {
     flushOneRow();
   }
+  patchHeaderNow(); // la cabecera refleja ya las filas recien volcadas
   sdWriteEnd();
 }
 
@@ -299,6 +301,25 @@ uint32_t rowSizeBytes() {
   return (raw + 3) & ~((uint32_t)3); // redondeo a multiplo de 4
 }
 
+// Deja la cabecera BMP (alto y tamano de fichero, en los offsets 22 y 2)
+// coherente con lo que hay REALMENTE escrito en la SD en este momento
+// (rowsWrittenToFile filas completas), no con lo que se espera llegar a
+// escribir. Se llama tanto tras cada tanda de filas volcadas durante la
+// impresion como al cerrar la pagina, de forma que si alguien abre el
+// fichero a medio generar, encuentra siempre un BMP valido y autoconsistente
+// (ancho x filas-escritas-hasta-ahora), nunca una cabecera a 0 ni una que
+// prometa mas filas de las que hay fisicamente en el fichero.
+void patchHeaderNow() {
+  uint32_t rs = rowSizeBytes();
+  uint32_t endPos = 54 + rs * rowsWrittenToFile; // fin real de los datos escritos hasta ahora
+  pageFile.seek(2);
+  writeLE32(pageFile, endPos); // tamano de fichero = lo que hay escrito de verdad
+  pageFile.seek(22);
+  writeLE32(pageFile, (uint32_t)(-(int32_t)rowsWrittenToFile)); // alto negativo (top-down) = filas escritas hasta ahora
+  pageFile.flush(); // que quede fisicamente en la SD antes de que alguien mas lo lea
+  pageFile.seek(endPos); // IMPRESCINDIBLE: volver al final real para poder seguir anexando filas
+}
+
 void openNewPage() {
   // pageIndex es un contador en RAM que arranca de 0 en cada reinicio del
   // ESP32, pero los ficheros de sesiones anteriores siguen en la SD. Para no
@@ -324,14 +345,17 @@ void openNewPage() {
   }
 
   sdWriteBegin();
-  // --- Cabecera BMP (54 bytes), con alto y tamano en 0 como marcador ---
+  // --- Cabecera BMP (54 bytes). Los campos de alto y tamano se escriben
+  // primero con 0 y se corrigen a continuacion con patchHeaderNow(), que ya
+  // en este punto (0 filas escritas) los deja en su valor coherente real:
+  // tamano=54 (justo la cabecera), alto=0 (todavia no hay ninguna fila).
   pageFile.write((const uint8_t*)"BM", 2);
-  writeLE32(pageFile, 0);           // tamano de fichero (se rellena al cerrar)
+  writeLE32(pageFile, 0);           // tamano de fichero (lo corrige patchHeaderNow() debajo)
   writeLE32(pageFile, 0);           // reservado
   writeLE32(pageFile, 54);          // offset a los datos de pixel
   writeLE32(pageFile, 40);          // tamano de BITMAPINFOHEADER
   writeLE32(pageFile, PAGE_WIDTH_DOTS);
-  writeLE32(pageFile, 0);           // alto (se rellena al cerrar, en negativo = top-down)
+  writeLE32(pageFile, 0);           // alto (lo corrige patchHeaderNow() debajo)
   writeLE16(pageFile, 1);           // planos
   writeLE16(pageFile, 24);          // bits por pixel
   writeLE32(pageFile, 0);           // compresion: BI_RGB (sin comprimir)
@@ -340,7 +364,6 @@ void openNewPage() {
   writeLE32(pageFile, 2834);        // resolucion Y ~ 180dpi en pixeles/metro
   writeLE32(pageFile, 0);           // colores en la paleta
   writeLE32(pageFile, 0);           // colores importantes
-  sdWriteEnd();
 
   bandBase = 0;
   cursorX = 0;
@@ -350,6 +373,10 @@ void openNewPage() {
   maxYUsed = -1;
   memset(band, COLOR_WHITE_INDEX, sizeof(band));
   pageOpen = true;
+
+  patchHeaderNow(); // deja la cabecera coherente (54/0) antes de que llegue ningun dato mas
+  sdWriteEnd();
+
   Serial.printf("[INFO] Nueva pagina: %s\n", currentFileName);
 }
 
@@ -391,15 +418,7 @@ void closePage() {
   // haber llegado justo al final.
   while (bandBase < PAGE_HEIGHT_DOTS) flushOneRow();
 
-  // Corregir cabecera con el alto real (negativo = orden top-down) y el tamano
-  uint32_t rs = rowSizeBytes();
-  uint32_t fileSize = 54 + rs * rowsWrittenToFile;
-  pageFile.seek(2);
-  writeLE32(pageFile, fileSize);
-  pageFile.seek(22);
-  writeLE32(pageFile, (uint32_t)(-(int32_t)rowsWrittenToFile)); // alto negativo = top-down
-  pageFile.flush(); // fuerza la escritura fisica en la SD (close() ya lo hace, pero
-                     // se deja explicito: es el ultimo dato critico, la cabecera)
+  patchHeaderNow(); // cabecera final: alto y tamano coherentes con las PAGE_HEIGHT_DOTS filas ya escritas
   pageFile.close();
 
   sdWriteEnd();
@@ -477,12 +496,29 @@ void drawChar(uint8_t c) {
   int32_t yBase = cursorY;
   if (scriptMode == 2) yBase = cursorY + (fullHeight - thisHeight); // subindice: alineado abajo
 
+  // Cursiva por cizalladura continua: cada fila del caracter se desplaza un
+  // poco mas hacia la derecha cuanto mas arriba esta (fila 0 = la de mas
+  // desplazamiento, la ultima fila = sin desplazamiento), dando el lean
+  // tipico de la cursiva. IMPORTANTE (ver aviso en la respuesta): la
+  // version anterior dividia esto entre 2, lo que dejaba un desplazamiento
+  // maximo de 2-3 puntos sobre un caracter de ~21 puntos de alto: tecnicamente
+  // se aplicaba, pero era casi imperceptible a simple vista. Aqui se usa el
+  // recorrido completo (sin dividir) para que se note claramente.
+  uint8_t italicShearMax = fc.rows - 1;
+
+  // Efecto de "bandas" del modo borrador: al expandir cada punto de la
+  // fuente a un bloque de scaleY filas, en borrador solo se pinta la mitad
+  // superior de ese bloque (dejando la mitad inferior en blanco), que es el
+  // aspecto rayado tipico de una impresora matricial en draft. En modo NLQ
+  // se pinta el bloque completo, como hasta ahora.
+  uint8_t paintRows = lqMode ? scaleY : (uint8_t)max(1, scaleY / 2);
+
   for (int col = 0; col < fc.cols; col++) {
     uint8_t colBits = pgm_read_byte(&glyph[col]);
     for (int row = 0; row < fc.rows; row++) {
       if (!(colBits & (1 << row))) continue;
-      int8_t xShear = italicMode ? (int8_t)((fc.rows - 1 - row) / 2) : 0;
-      for (int sy = 0; sy < scaleY; sy++) {
+      int8_t xShear = italicMode ? (int8_t)(italicShearMax - row) : 0;
+      for (int sy = 0; sy < paintRows; sy++) {
         for (int sx = 0; sx < scaleX; sx++) {
           int32_t x = cursorX + col * scaleX + sx + xShear;
           int32_t y = yBase + row * scaleY + sy;
