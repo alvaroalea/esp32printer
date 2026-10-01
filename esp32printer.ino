@@ -146,6 +146,11 @@ void sdWriteBegin();
 void sdWriteEnd();
 void updateStatusLed();
 void patchHeaderNow();
+
+// Definidas en wifi_web.ino (otra pestana del MISMO sketch, debe estar en
+// la misma carpeta): WiFi con portal de configuracion, OTA y servidor web.
+void setupWifiOtaWeb();
+void loopWifiOtaWeb();
 static const RGB PALETTE[8] = {
   {0,   0,   0  },  // 0 Negro
   {216, 0,   132},  // 1 Magenta
@@ -474,7 +479,7 @@ FontChoice chooseFont() {
     case 1: // Sans Serif
       return { font5x7, FONT_COLS, FONT_ROWS, FONT_FIRST_CHAR, FONT_LAST_CHAR, 3 };
     default: // Roman, Courier, Prestige, Script, OCR-B, OCR-A -> familia de 8x8
-      return { font8x8, FONT2_COLS, FONT2_ROWS, FONT2_FIRST_CHAR, FONT2_LAST_CHAR, 2 };
+      return { font8x8, FONT1_COLS, FONT1_ROWS, FONT1_FIRST_CHAR, FONT1_LAST_CHAR, 3 };
   }
 }
 
@@ -925,6 +930,11 @@ void setup() {
   buttonStableState = buttonLastReading;
 
   Serial.println("[INFO] Esperando datos por el puerto serie (impresora)...");
+
+  // WiFi (con portal de configuracion si hace falta), OTA y servidor web.
+  // Se hace lo ultimo en setup() para que la impresora (SD, LED, puerto
+  // serie) ya este lista incluso si esto tarda o si no hay WiFi disponible.
+  setupWifiOtaWeb();
 }
 
 void loop() {
@@ -956,4 +966,6 @@ void loop() {
   }
 
   updateStatusLed();
+
+  loopWifiOtaWeb();
 }

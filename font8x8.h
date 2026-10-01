@@ -5,10 +5,10 @@
 #pragma once
 #include <Arduino.h>
 
-#define FONT2_FIRST_CHAR 32
-#define FONT2_LAST_CHAR 126
-#define FONT2_COLS 8
-#define FONT2_ROWS 8
+#define FONT1_FIRST_CHAR 32
+#define FONT1_LAST_CHAR 126
+#define FONT1_COLS 8
+#define FONT1_ROWS 8
 
 static const uint8_t font8x8[] PROGMEM = {
   0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00, // 32 ' '
