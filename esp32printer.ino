@@ -62,6 +62,8 @@
 #include <SPI.h>
 #include <SD.h>
 #include <Adafruit_NeoPixel.h> // Libreria "Adafruit NeoPixel" (instalar desde el Gestor de Librerias si falta)
+#include <freertos/FreeRTOS.h> // mutex de la SD (sdMutex) -- incluidas en el nucleo ESP32 de Arduino
+#include <freertos/semphr.h>
 #include "font5x7.h"
 #include "font8x8.h"
 
@@ -73,6 +75,9 @@
 #define SD_MOSI_PIN   11
 #define SD_SCK_PIN    12
 #define SD_MISO_PIN   13
+#define SD_SPI_FREQ_HZ 24000000UL // 24MHz: bastante mas rapido que el por defecto
+                                   // (4MHz). Si da errores de lectura/escritura
+                                   // (cableado largo o mala calidad), bajalo.
 
 // --- Puerto serie hacia el MAX232 (Serial2 = UART2 del ESP32) ---
 #define SERIAL_TX_PIN 17
@@ -91,6 +96,19 @@
                                   // al llegar al final de la hoja) rellena de blanco lo que
                                   // falte, y si el contenido llega a esta altura sin recibir
                                   // Form Feed, la pagina se cierra sola y se abre una nueva.
+
+// --- Cache en PSRAM para el servidor web (ver wifi_web.ino) ---
+// Una pagina completa (PAGE_WIDTH_DOTS x PAGE_HEIGHT_DOTS, 24 bits) ocupa
+// ~8.4MB; un ESP32-S3 N16R8 solo tiene 8MB de PSRAM en total, asi que NO
+// cabe una pagina entera de sobra (hace falta PSRAM tambien para el stack
+// de WiFi y demas). Por eso esto es un presupuesto (cuanto se reserva para
+// la cache), no el tamano de la pagina: mientras se imprime, cada fila que
+// se vuelca a la SD se copia tambien aqui (si hay hueco); el servidor web
+// sirve directamente desde esta cache lo que quepa en ella y solo recurre a
+// leer de la SD para el resto (si la pagina crece mas alla del presupuesto).
+// Si no hay PSRAM en la placa, esto se desactiva solo y todo se sirve desde
+// la SD como antes.
+#define WEB_BMP_CACHE_MAX_BYTES (6UL * 1024 * 1024) // 6MB (ajustable)
 #define BAND_HEIGHT       48     // Alto del buffer de bandas en filas (RAM ~ 1440*48 bytes)
 #define DEFAULT_LINE_DOTS 30     // 1/6" a 180dpi = 30 puntos (interlineado por defecto)
 
@@ -144,13 +162,17 @@ struct GfxMode { uint8_t pins; uint16_t dpi; }; // ver el comentario de FontChoi
 // las funciones del LED estan definidas mas adelante en el fichero.
 void sdWriteBegin();
 void sdWriteEnd();
+void sdAccessBegin();
+void sdAccessEnd();
 void updateStatusLed();
 void patchHeaderNow();
 
 // Definidas en wifi_web.ino (otra pestana del MISMO sketch, debe estar en
 // la misma carpeta): WiFi con portal de configuracion, OTA y servidor web.
-void setupWifiOtaWeb();
-void loopWifiOtaWeb();
+// Corren en su PROPIA tarea de FreeRTOS (ver startWifiWebTask()) para que
+// el autoConnect() bloqueante de WiFiManager no retrase el arranque de la
+// emulacion de impresora ni un segundo.
+void startWifiWebTask();
 static const RGB PALETTE[8] = {
   {0,   0,   0  },  // 0 Negro
   {216, 0,   132},  // 1 Magenta
@@ -193,6 +215,13 @@ bool everReceivedByte = false;  // evita que el LED muestre "recibiendo" antes d
 bool sdOk = true;               // false si el montaje inicial o la apertura de un fichero fallan
 unsigned long lastSdRetryMillis = 0;
 bool writingToSD = false;       // true mientras hay una escritura fisica en curso en la SD
+
+// Cache en PSRAM de la pagina EN CURSO (ver comentario de WEB_BMP_CACHE_MAX_BYTES
+// arriba). bmpCacheBytes = cuantos bytes del fichero actual estan reflejados
+// en la cache ahora mismo (desde el byte 0); nunca mas que bmpCacheCapacity.
+uint8_t *bmpCacheBuffer = nullptr;
+uint32_t bmpCacheCapacity = 0;
+uint32_t bmpCacheBytes = 0;
 
 bool buttonFlashActive = false;
 unsigned long buttonFlashStartMillis = 0;
@@ -314,6 +343,28 @@ uint32_t rowSizeBytes() {
 // fichero a medio generar, encuentra siempre un BMP valido y autoconsistente
 // (ancho x filas-escritas-hasta-ahora), nunca una cabecera a 0 ni una que
 // prometa mas filas de las que hay fisicamente en el fichero.
+// Copia 'len' bytes al final de la cache PSRAM (si hay hueco) empezando en
+// la posicion bmpCacheBytes, y avanza bmpCacheBytes. Si no hay cache o ya no
+// queda sitio, no hace nada (la pagina sigue funcionando igual, sin cache
+// para esa parte: el servidor web recurrira a la SD para lo que falte).
+void cacheAppend(const uint8_t *data, uint32_t len) {
+  if (!bmpCacheBuffer) return;
+  if (bmpCacheBytes + len > bmpCacheCapacity) return;
+  memcpy(bmpCacheBuffer + bmpCacheBytes, data, len);
+  bmpCacheBytes += len;
+}
+
+// Reescribe 4 bytes ya presentes en la cache (para mantener los campos de
+// alto/tamano de la cabecera cacheada en sincronia con patchHeaderNow()).
+void cachePatchU32(uint32_t offset, uint32_t value) {
+  if (!bmpCacheBuffer) return;
+  if (offset + 4 > bmpCacheBytes) return; // esos bytes aun no estan cacheados
+  bmpCacheBuffer[offset + 0] = (uint8_t)(value & 0xFF);
+  bmpCacheBuffer[offset + 1] = (uint8_t)((value >> 8) & 0xFF);
+  bmpCacheBuffer[offset + 2] = (uint8_t)((value >> 16) & 0xFF);
+  bmpCacheBuffer[offset + 3] = (uint8_t)((value >> 24) & 0xFF);
+}
+
 void patchHeaderNow() {
   uint32_t rs = rowSizeBytes();
   uint32_t endPos = 54 + rs * rowsWrittenToFile; // fin real de los datos escritos hasta ahora
@@ -323,9 +374,14 @@ void patchHeaderNow() {
   writeLE32(pageFile, (uint32_t)(-(int32_t)rowsWrittenToFile)); // alto negativo (top-down) = filas escritas hasta ahora
   pageFile.flush(); // que quede fisicamente en la SD antes de que alguien mas lo lea
   pageFile.seek(endPos); // IMPRESCINDIBLE: volver al final real para poder seguir anexando filas
+
+  cachePatchU32(2, endPos);
+  cachePatchU32(22, (uint32_t)(-(int32_t)rowsWrittenToFile));
 }
 
 void openNewPage() {
+  sdAccessBegin(); // bloquea la SD para toda la funcion (busqueda de nombre + apertura + cabecera)
+
   // pageIndex es un contador en RAM que arranca de 0 en cada reinicio del
   // ESP32, pero los ficheros de sesiones anteriores siguen en la SD. Para no
   // sobrescribirlos, se busca el primer nombre libre a partir de pageIndex+1.
@@ -338,6 +394,7 @@ void openNewPage() {
     // No deberia ocurrir salvo que la SD ya tenga las 9999 paginas usadas.
     Serial.println("[ERROR] No se encontro un nombre de pagina libre (PAGE0001..PAGE9999.BMP agotados).");
     pageOpen = false;
+    sdAccessEnd();
     return;
   }
   pageFile = SD.open(currentFileName, FILE_WRITE);
@@ -345,30 +402,41 @@ void openNewPage() {
     Serial.printf("[ERROR] No se pudo crear %s en la SD\n", currentFileName);
     pageOpen = false;
     sdOk = false;
+    sdAccessEnd();
     updateStatusLed(); // reflejar el fallo de inmediato, sin esperar al loop()
     return;
   }
 
-  sdWriteBegin();
-  // --- Cabecera BMP (54 bytes). Los campos de alto y tamano se escriben
-  // primero con 0 y se corrigen a continuacion con patchHeaderNow(), que ya
-  // en este punto (0 filas escritas) los deja en su valor coherente real:
-  // tamano=54 (justo la cabecera), alto=0 (todavia no hay ninguna fila).
-  pageFile.write((const uint8_t*)"BM", 2);
-  writeLE32(pageFile, 0);           // tamano de fichero (lo corrige patchHeaderNow() debajo)
-  writeLE32(pageFile, 0);           // reservado
-  writeLE32(pageFile, 54);          // offset a los datos de pixel
-  writeLE32(pageFile, 40);          // tamano de BITMAPINFOHEADER
-  writeLE32(pageFile, PAGE_WIDTH_DOTS);
-  writeLE32(pageFile, 0);           // alto (lo corrige patchHeaderNow() debajo)
-  writeLE16(pageFile, 1);           // planos
-  writeLE16(pageFile, 24);          // bits por pixel
-  writeLE32(pageFile, 0);           // compresion: BI_RGB (sin comprimir)
-  writeLE32(pageFile, 0);           // tamano de la imagen (0 valido para BI_RGB)
-  writeLE32(pageFile, 2834);        // resolucion X ~ 180dpi en pixeles/metro
-  writeLE32(pageFile, 2834);        // resolucion Y ~ 180dpi en pixeles/metro
-  writeLE32(pageFile, 0);           // colores en la paleta
-  writeLE32(pageFile, 0);           // colores importantes
+  // Resto de la funcion: ya dentro de la zona de escritura (indicador LED
+  // incluido). writingToSD ya estaba implicitamente "en curso" desde el
+  // sdAccessBegin() de arriba, pero el LED solo refleja "escribiendo" a
+  // partir de aqui para no mostrar celeste durante la mera busqueda de
+  // nombre, que es casi instantanea.
+  writingToSD = true;
+  updateStatusLed();
+
+  // --- Cabecera BMP (54 bytes), construida en RAM y escrita de una sola
+  // vez (una sola transaccion SPI en vez de 14 escrituras sueltas). Alto y
+  // tamano se dejan primero a 0 y los corrige patchHeaderNow() justo
+  // debajo, que en este punto (0 filas escritas) los deja en su valor
+  // coherente real: tamano=54 (justo la cabecera), alto=0.
+  uint8_t header[54];
+  memset(header, 0, sizeof(header));
+  header[0] = 'B'; header[1] = 'M';
+  // bytes 2..5 (tamano) y 10..13 (offset a los pixeles) se fijan abajo
+  header[10] = 54; // offset a los datos de pixel (54, cabe en 1 byte)
+  header[14] = 40; // tamano de BITMAPINFOHEADER
+  header[18] = (uint8_t)(PAGE_WIDTH_DOTS & 0xFF);
+  header[19] = (uint8_t)((PAGE_WIDTH_DOTS >> 8) & 0xFF);
+  header[20] = (uint8_t)((PAGE_WIDTH_DOTS >> 16) & 0xFF);
+  header[21] = (uint8_t)((PAGE_WIDTH_DOTS >> 24) & 0xFF);
+  // bytes 22..25 (alto) se fijan abajo
+  header[26] = 1; // planos
+  header[28] = 24; // bits por pixel
+  // bytes 30..33 (compresion BI_RGB) y 34..37 (tamano de imagen) ya son 0
+  header[38] = 0x12; header[39] = 0x0B; // ~2834 pixeles/metro (180dpi), X
+  header[42] = 0x12; header[43] = 0x0B; // idem, Y
+  pageFile.write(header, sizeof(header));
 
   bandBase = 0;
   cursorX = 0;
@@ -379,8 +447,14 @@ void openNewPage() {
   memset(band, COLOR_WHITE_INDEX, sizeof(band));
   pageOpen = true;
 
-  patchHeaderNow(); // deja la cabecera coherente (54/0) antes de que llegue ningun dato mas
-  sdWriteEnd();
+  bmpCacheBytes = 0; // la cache PSRAM empieza de cero para cada pagina nueva
+  cacheAppend(header, sizeof(header));
+
+  patchHeaderNow(); // deja la cabecera (en la SD y en la cache) coherente: 54/0
+
+  writingToSD = false;
+  updateStatusLed();
+  sdAccessEnd();
 
   Serial.printf("[INFO] Nueva pagina: %s\n", currentFileName);
 }
@@ -389,20 +463,22 @@ void flushOneRow() {
   // Vuelca a la SD la fila mas antigua del buffer (bandBase) y la deja en blanco
   // para poder reutilizar ese hueco.
   if (!pageOpen) { bandBase++; return; }
-  uint8_t rowRGB[PAGE_WIDTH_DOTS * 3];
+  uint32_t rs = rowSizeBytes();
+  uint8_t rowBuf[PAGE_WIDTH_DOTS * 3 + 3]; // +3: margen para el relleno a multiplo de 4
   int32_t rel = bandBase % BAND_HEIGHT;
   if (rel < 0) rel += BAND_HEIGHT;
   for (int x = 0; x < PAGE_WIDTH_DOTS; x++) {
     uint8_t idx = band[rel][x];
     RGB c = (idx == COLOR_WHITE_INDEX) ? PALETTE[7] : PALETTE[idx];
     // BMP almacena en orden BGR
-    rowRGB[x*3+0] = c.b;
-    rowRGB[x*3+1] = c.g;
-    rowRGB[x*3+2] = c.r;
+    rowBuf[x*3+0] = c.b;
+    rowBuf[x*3+1] = c.g;
+    rowBuf[x*3+2] = c.r;
   }
-  uint32_t rs = rowSizeBytes();
-  pageFile.write(rowRGB, PAGE_WIDTH_DOTS * 3);
-  for (uint32_t p = PAGE_WIDTH_DOTS * 3; p < rs; p++) pageFile.write((uint8_t)0);
+  for (uint32_t p = PAGE_WIDTH_DOTS * 3; p < rs; p++) rowBuf[p] = 0; // relleno a multiplo de 4
+
+  pageFile.write(rowBuf, rs); // una unica escritura, en vez de datos+relleno por separado
+  cacheAppend(rowBuf, rs);
 
   memset(band[rel], COLOR_WHITE_INDEX, PAGE_WIDTH_DOTS);
   bandBase++;
@@ -439,9 +515,11 @@ void finishPageIfNeeded() {
     closePage();
   } else if (pageOpen) {
     // Pagina vacia: se descarta sin generar fichero util
+    sdWriteBegin();
     pageFile.close();
     SD.remove(currentFileName);
     pageOpen = false;
+    sdWriteEnd();
   }
 }
 
@@ -841,13 +919,35 @@ void checkCloseButton() {
 
 void updateStatusLed(); // adelantada: sdWriteBegin/End la llaman para reflejar el cambio al instante
 
+// Mutex de la tarjeta SD: ahora que WiFi/OTA/servidor web corren en su
+// PROPIA tarea de FreeRTOS en el otro nucleo (ver wifi_web.ino), hay dos
+// nucleos que de verdad pueden intentar tocar la SPI de la SD a la vez (el
+// bucle principal, que imprime, y el servidor web, que sirve el BMP). La
+// libreria SD no es segura frente a eso, asi que cualquier acceso a la SD
+// -- escribir o leer -- debe hacerse entre sdAccessBegin() y sdAccessEnd().
+SemaphoreHandle_t sdMutex = NULL;
+
+void sdAccessBegin() {
+  if (sdMutex) xSemaphoreTake(sdMutex, portMAX_DELAY);
+}
+void sdAccessEnd() {
+  if (sdMutex) xSemaphoreGive(sdMutex);
+}
+
+// sdWriteBegin/End son para el camino de ESCRITURA del emulador de
+// impresora: ademas de reservar el acceso exclusivo a la SD, reflejan en el
+// LED que se esta escribiendo. El servidor web, que solo LEE, usa
+// directamente sdAccessBegin()/sdAccessEnd() (sin tocar el LED, ver
+// wifi_web.ino) para no mentir con el color "escribiendo".
 void sdWriteBegin() {
+  sdAccessBegin();
   writingToSD = true;
   updateStatusLed(); // cambia el LED YA, sin esperar a la siguiente vuelta de loop()
 }
 void sdWriteEnd() {
   writingToSD = false;
   updateStatusLed();
+  sdAccessEnd();
 }
 
 uint32_t ledColor(uint8_t r, uint8_t g, uint8_t b) {
@@ -883,15 +983,35 @@ void setup() {
   delay(200);
   Serial.println("\n[INFO] Emulador de impresora Epson LQ 24 agujas color - iniciando...");
 
+  sdMutex = xSemaphoreCreateMutex(); // antes de cualquier acceso a la SD
+
   rgbLed.begin();
   rgbLed.setBrightness((uint8_t)(RGB_LED_BRIGHTNESS * 255.0f + 0.5f)); // brillo real de la libreria (antes no se ajustaba)
   rgbLed.setPixelColor(0, ledColor(0, 255, 0)); // verde por defecto (sin pagina) mientras arranca
   rgbLed.show();
 
+  // Cache en PSRAM para el servidor web (ver WEB_BMP_CACHE_MAX_BYTES arriba).
+  // psramFound()/ps_malloc() son funciones del propio nucleo ESP32 de
+  // Arduino; si la placa no tiene PSRAM (o psramFound() da negativo),
+  // bmpCacheBuffer se queda en nullptr y todo sigue funcionando igual, solo
+  // que el servidor web leera siempre de la SD (como hasta ahora).
+  if (psramFound()) {
+    bmpCacheBuffer = (uint8_t *)ps_malloc(WEB_BMP_CACHE_MAX_BYTES);
+    if (bmpCacheBuffer) {
+      bmpCacheCapacity = WEB_BMP_CACHE_MAX_BYTES;
+      Serial.printf("[INFO] Cache PSRAM activa para el servidor web: %lu KB.\n",
+                    (unsigned long)(bmpCacheCapacity / 1024));
+    } else {
+      Serial.println("[WARN] Hay PSRAM pero ps_malloc() fallo; el servidor web leera siempre de la SD.");
+    }
+  } else {
+    Serial.println("[INFO] Esta placa no tiene PSRAM; el servidor web leera siempre de la SD.");
+  }
+
   // El ESP32-S3 no tiene un mapeo VSPI/HSPI fijo: hay que indicar los pines
   // explicitamente antes de montar la SD.
   SPI.begin(SD_SCK_PIN, SD_MISO_PIN, SD_MOSI_PIN, SD_CS_PIN);
-  if (!SD.begin(SD_CS_PIN)) {
+  if (!SD.begin(SD_CS_PIN, SPI, SD_SPI_FREQ_HZ)) {
     Serial.println("[ERROR] No se pudo montar la tarjeta SD. Revisa el cableado/CS.");
     sdOk = false;
   } else {
@@ -931,10 +1051,11 @@ void setup() {
 
   Serial.println("[INFO] Esperando datos por el puerto serie (impresora)...");
 
-  // WiFi (con portal de configuracion si hace falta), OTA y servidor web.
-  // Se hace lo ultimo en setup() para que la impresora (SD, LED, puerto
-  // serie) ya este lista incluso si esto tarda o si no hay WiFi disponible.
-  setupWifiOtaWeb();
+  // WiFi (con portal de configuracion si hace falta), OTA y servidor web,
+  // en su propia tarea en el otro nucleo: la impresora ya esta lista para
+  // recibir datos AHORA MISMO, sin esperar a que WiFiManager conecte (o se
+  // quede hasta 3 minutos esperando a que alguien configure la red).
+  startWifiWebTask();
 }
 
 void loop() {
@@ -950,8 +1071,11 @@ void loop() {
   if (!sdOk && (millis() - lastSdRetryMillis > SD_RETRY_INTERVAL_MS)) {
     lastSdRetryMillis = millis();
     Serial.println("[INFO] Reintentando montar la tarjeta SD...");
+    sdAccessBegin();
     SD.end();
-    if (SD.begin(SD_CS_PIN)) {
+    bool recovered = SD.begin(SD_CS_PIN, SPI, SD_SPI_FREQ_HZ);
+    sdAccessEnd();
+    if (recovered) {
       Serial.println("[INFO] Tarjeta SD recuperada.");
       sdOk = true;
       updateStatusLed(); // reflejar la recuperacion de inmediato, sin esperar a la siguiente vuelta
@@ -966,6 +1090,4 @@ void loop() {
   }
 
   updateStatusLed();
-
-  loopWifiOtaWeb();
 }
