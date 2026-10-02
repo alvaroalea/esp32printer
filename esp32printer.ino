@@ -64,7 +64,7 @@
 #include <Adafruit_NeoPixel.h> // Libreria "Adafruit NeoPixel" (instalar desde el Gestor de Librerias si falta)
 #include <freertos/FreeRTOS.h> // mutex de la SD (sdMutex) -- incluidas en el nucleo ESP32 de Arduino
 #include <freertos/semphr.h>
-#include "font5x7.h"
+#include "font5x7b.h"
 #include "font8x8.h"
 /**/
 #include "roman.h"
@@ -594,7 +594,7 @@ FontChoice chooseFont() {
       return { font5x7, FONT_COLS, FONT_ROWS, FONT_FIRST_CHAR, FONT_LAST_CHAR, 3 };
   }
 }
-*/
+/**/
 FontChoice chooseFont() {
   if (!lqMode) {
     return { font5x7, FONT_COLS, FONT_ROWS, FONT_FIRST_CHAR, FONT_LAST_CHAR, 3 };
@@ -846,6 +846,12 @@ void handleByteInner(uint8_t b) {
         default:
           // Comando ESC/P no soportado: se descarta un unico byte de posible
           // parametro para intentar no desincronizar el resto del flujo.
+          // Se deja una linea de depuracion con el caracter recibido (y su
+          // valor en hexadecimal, ya que muchos de estos comandos son no
+          // imprimibles) para poder ver por el puerto serie de USB que
+          // secuencias esta mandando el host que todavia no se interpretan.
+          Serial.printf("[DEBUG] Comando ESC no soportado: '%c' (0x%02X)\n",
+                        (b >= 0x20 && b <= 0x7E) ? (char)b : '?', b);
           escState = ST_ESC_SKIP1;
           return;
       }

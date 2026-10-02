@@ -80,6 +80,17 @@
 #define WEB_STREAM_CHUNK_BYTES 4096  // trozo de lectura al servir desde la SD (antes
                                       // era un buffer pequeno interno de streamFile())
 
+// Reintentos rapidos con las credenciales ya guardadas, antes de recurrir a
+// WiFiManager. Pensado para el tipico "E (...) wifi:Association refused too
+// many times, max allowed 1" que suelta a veces el propio IDF justo tras un
+// reset o reflasheo: casi siempre es el router, que todavia tiene colgada
+// la sesion anterior del ESP32 y la suelta sola al cabo de unos segundos.
+// Como todo esto corre en su propia tarea (ver startWifiWebTask()), estos
+// reintentos con espera NUNCA afectan a la impresora.
+#define WIFI_QUICK_RETRY_COUNT      3    // cuantos intentos rapidos antes de WiFiManager
+#define WIFI_QUICK_RETRY_WAIT_MS    5000 // cuanto se espera a que conecte cada intento
+#define WIFI_QUICK_RETRY_DELAY_MS   3000 // pausa entre un intento fallido y el siguiente
+
 WebServer webServer(80);
 
 // --- Pagina principal ---
@@ -286,13 +297,43 @@ void handleWifiReset() {
   ESP.restart();
 }
 
+// Reintentos rapidos reutilizando las credenciales ya guardadas (las mismas
+// que usa WiFiManager: WiFi.begin() sin argumentos reconecta con lo ultimo
+// guardado en la NVS). Si no hay ninguna red guardada todavia (primer
+// arranque), no tiene sentido reintentar nada: se devuelve false al
+// instante para pasar directamente al portal de configuracion.
+bool tryQuickWifiReconnect() {
+  if (WiFi.SSID().length() == 0) return false;
+
+  for (int attempt = 1; attempt <= WIFI_QUICK_RETRY_COUNT; attempt++) {
+    Serial.printf("[WIFI] Intento rapido de reconexion %d/%d...\n", attempt, WIFI_QUICK_RETRY_COUNT);
+    WiFi.begin();
+    unsigned long start = millis();
+    while (millis() - start < WIFI_QUICK_RETRY_WAIT_MS) {
+      if (WiFi.status() == WL_CONNECTED) return true;
+      delay(100);
+    }
+    if (attempt < WIFI_QUICK_RETRY_COUNT) delay(WIFI_QUICK_RETRY_DELAY_MS);
+  }
+  return false;
+}
+
 void setupWifiOtaWeb() {
+  // Antes de recurrir a WiFiManager (que si falla aqui, abre su propio
+  // punto de acceso de configuracion), unos pocos intentos rapidos con la
+  // red ya guardada: resuelve solo el rechazo transitorio de asociacion sin
+  // molestar con el portal cuando la red es, de hecho, la correcta.
+  bool connected = tryQuickWifiReconnect();
+
   WiFiManager wm;
   wm.setConfigPortalTimeout(WIFI_CONFIG_PORTAL_TIMEOUT_S);
-  // autoConnect() intenta primero la ultima red guardada; si no lo consigue,
-  // monta el punto de acceso de configuracion con ese nombre y se bloquea
-  // aqui hasta que alguien la configura o pasa el timeout de arriba.
-  bool connected = wm.autoConnect(WIFI_CONFIG_AP_NAME);
+  if (!connected) {
+    // autoConnect() intenta de nuevo la ultima red guardada; si tampoco lo
+    // consigue, monta el punto de acceso de configuracion con ese nombre y
+    // se bloquea aqui hasta que alguien la configura o pasa el timeout de
+    // arriba.
+    connected = wm.autoConnect(WIFI_CONFIG_AP_NAME);
+  }
   if (!connected) {
     Serial.println("[WIFI] Sin conexion (no configurada o fuera de alcance). "
                     "La impresora sigue funcionando sin red; conectate al "
