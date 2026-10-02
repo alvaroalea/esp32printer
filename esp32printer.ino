@@ -64,7 +64,7 @@
 #include <Adafruit_NeoPixel.h> // Libreria "Adafruit NeoPixel" (instalar desde el Gestor de Librerias si falta)
 #include <freertos/FreeRTOS.h> // mutex de la SD (sdMutex) -- incluidas en el nucleo ESP32 de Arduino
 #include <freertos/semphr.h>
-#include "font5x7b.h"
+#include "font5x7.h"
 #include "font8x8.h"
 /**/
 #include "roman.h"
