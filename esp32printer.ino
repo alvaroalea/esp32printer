@@ -8,8 +8,8 @@
  * Epson LQ de 24 agujas con cinta de color (Black/Cyan/Magenta/Yellow).
  * Interpreta texto y graficos de puntos, los "pinta" en un lienzo virtual
  * y, cada vez que llega un salto de pagina (Form Feed) o pasan unos segundos
- * sin actividad, vuelca la pagina completa a un fichero BMP (24 bits, sin
- * comprimir, formato BI_RGB) en la tarjeta SD.
+ * sin actividad, vuelca la pagina completa a un fichero BMP indexado de 4
+ * bits (16 colores de paleta, formato BI_RGB sin comprimir) en la SD.
  *
  * ---------------------------------------------------------------------
  * HARDWARE ESPERADO (ajustar en la seccion CONFIGURACION):
@@ -66,7 +66,14 @@
 #include <freertos/semphr.h>
 #include "font5x7.h"
 #include "font8x8.h"
-
+/**/
+#include "roman.h"
+#include "courier.h"
+#include "prestige.h"
+#include "script.h"
+#include "OCRB.h"
+#include "OCRA.h"
+/**/
 // ================================ CONFIGURACION ===========================
 
 // --- Tarjeta SD (SPI) --- (pines para ESP32-S3; el S3 no tiene un mapeo
@@ -98,17 +105,17 @@
                                   // Form Feed, la pagina se cierra sola y se abre una nueva.
 
 // --- Cache en PSRAM para el servidor web (ver wifi_web.ino) ---
-// Una pagina completa (PAGE_WIDTH_DOTS x PAGE_HEIGHT_DOTS, 24 bits) ocupa
-// ~8.4MB; un ESP32-S3 N16R8 solo tiene 8MB de PSRAM en total, asi que NO
-// cabe una pagina entera de sobra (hace falta PSRAM tambien para el stack
-// de WiFi y demas). Por eso esto es un presupuesto (cuanto se reserva para
-// la cache), no el tamano de la pagina: mientras se imprime, cada fila que
-// se vuelca a la SD se copia tambien aqui (si hay hueco); el servidor web
-// sirve directamente desde esta cache lo que quepa en ella y solo recurre a
-// leer de la SD para el resto (si la pagina crece mas alla del presupuesto).
-// Si no hay PSRAM en la placa, esto se desactiva solo y todo se sirve desde
-// la SD como antes.
-#define WEB_BMP_CACHE_MAX_BYTES (6UL * 1024 * 1024) // 6MB (ajustable)
+// Con el formato indexado de 4 bits, una pagina completa (PAGE_WIDTH_DOTS x
+// PAGE_HEIGHT_DOTS) ocupa ~1.4MB -- cabe de sobra en los 8MB de PSRAM de un
+// ESP32-S3 N16R8 (antes, en 24 bits sin comprimir, eran ~8.4MB y NO cabia
+// una pagina entera; de ahi que esto sea un "presupuesto" y no el tamano
+// de la pagina). Mientras se imprime, cada fila que se vuelca a la SD se
+// copia tambien aqui (si hay hueco); el servidor web sirve directamente
+// desde esta cache lo que quepa en ella y solo recurre a leer de la SD
+// para el resto (en la practica, con 2MB de presupuesto, nunca hace falta
+// para una pagina de tamano normal). Si no hay PSRAM en la placa, esto se
+// desactiva solo y todo se sirve desde la SD como antes.
+#define WEB_BMP_CACHE_MAX_BYTES (2UL * 1024 * 1024) // 2MB: cubre una pagina entera de sobra
 #define BAND_HEIGHT       48     // Alto del buffer de bandas en filas (RAM ~ 1440*48 bytes)
 #define DEFAULT_LINE_DOTS 30     // 1/6" a 180dpi = 30 puntos (interlineado por defecto)
 
@@ -184,6 +191,14 @@ static const RGB PALETTE[8] = {
   {255, 255, 255},  // 7 Blanco (no usado como tinta, solo de referencia)
 };
 #define COLOR_WHITE_INDEX 255  // marcador interno de "sin tinta" en el buffer
+
+// --- Formato de fichero: BMP INDEXADO de 4 bits (16 colores de paleta, de
+// los que se usan 8) en vez de BMP de 24 bits sin comprimir. Mismo aspecto
+// visual exacto (la paleta es la misma de siempre), pero cada pixel ocupa
+// medio byte en vez de tres: los ficheros quedan 6 veces mas pequenos, lo
+// que ademas acelera mucho servirlos por el servidor web.
+#define BMP_PALETTE_COLORS 16                              // minimo que admite el formato "4bpp" de BMP
+#define BMP_HEADER_BYTES (54 + BMP_PALETTE_COLORS * 4)      // cabecera + tabla de color (54 + 64 = 118)
 
 // ================================ ESTADO GLOBAL ============================
 
@@ -331,7 +346,7 @@ void writeLE32(File &f, uint32_t v) {
 }
 
 uint32_t rowSizeBytes() {
-  uint32_t raw = (uint32_t)PAGE_WIDTH_DOTS * 3;
+  uint32_t raw = ((uint32_t)PAGE_WIDTH_DOTS + 1) / 2; // 4 bits/pixel = 2 pixeles por byte
   return (raw + 3) & ~((uint32_t)3); // redondeo a multiplo de 4
 }
 
@@ -367,7 +382,7 @@ void cachePatchU32(uint32_t offset, uint32_t value) {
 
 void patchHeaderNow() {
   uint32_t rs = rowSizeBytes();
-  uint32_t endPos = 54 + rs * rowsWrittenToFile; // fin real de los datos escritos hasta ahora
+  uint32_t endPos = BMP_HEADER_BYTES + rs * rowsWrittenToFile; // fin real de los datos escritos hasta ahora
   pageFile.seek(2);
   writeLE32(pageFile, endPos); // tamano de fichero = lo que hay escrito de verdad
   pageFile.seek(22);
@@ -415,16 +430,18 @@ void openNewPage() {
   writingToSD = true;
   updateStatusLed();
 
-  // --- Cabecera BMP (54 bytes), construida en RAM y escrita de una sola
-  // vez (una sola transaccion SPI en vez de 14 escrituras sueltas). Alto y
-  // tamano se dejan primero a 0 y los corrige patchHeaderNow() justo
-  // debajo, que en este punto (0 filas escritas) los deja en su valor
-  // coherente real: tamano=54 (justo la cabecera), alto=0.
-  uint8_t header[54];
+  // --- Cabecera BMP indexada de 4 bits (BMP_HEADER_BYTES = 118 bytes:
+  // 54 de cabecera + 64 de tabla de color), construida en RAM y escrita de
+  // una sola vez (una sola transaccion SPI en vez de muchas escrituras
+  // sueltas). Alto y tamano se dejan primero a 0 y los corrige
+  // patchHeaderNow() justo debajo, que en este punto (0 filas escritas) los
+  // deja en su valor coherente real: tamano=BMP_HEADER_BYTES, alto=0.
+  uint8_t header[BMP_HEADER_BYTES];
   memset(header, 0, sizeof(header));
   header[0] = 'B'; header[1] = 'M';
   // bytes 2..5 (tamano) y 10..13 (offset a los pixeles) se fijan abajo
-  header[10] = 54; // offset a los datos de pixel (54, cabe en 1 byte)
+  header[10] = (uint8_t)(BMP_HEADER_BYTES & 0xFF); // offset a los datos de pixel
+  header[11] = (uint8_t)((BMP_HEADER_BYTES >> 8) & 0xFF);
   header[14] = 40; // tamano de BITMAPINFOHEADER
   header[18] = (uint8_t)(PAGE_WIDTH_DOTS & 0xFF);
   header[19] = (uint8_t)((PAGE_WIDTH_DOTS >> 8) & 0xFF);
@@ -432,10 +449,25 @@ void openNewPage() {
   header[21] = (uint8_t)((PAGE_WIDTH_DOTS >> 24) & 0xFF);
   // bytes 22..25 (alto) se fijan abajo
   header[26] = 1; // planos
-  header[28] = 24; // bits por pixel
+  header[28] = 4; // bits por pixel: 4 (16 colores de paleta, indexado)
   // bytes 30..33 (compresion BI_RGB) y 34..37 (tamano de imagen) ya son 0
   header[38] = 0x12; header[39] = 0x0B; // ~2834 pixeles/metro (180dpi), X
   header[42] = 0x12; header[43] = 0x0B; // idem, Y
+  // bytes 46..49 (colores en la paleta) y 50..53 (colores importantes) se
+  // dejan a 0, que para un bitmap indexado significa "el maximo del bit
+  // depth" (16), convencion estandar.
+
+  // Tabla de color (16 entradas x 4 bytes BGR0), justo despues de los 54
+  // bytes de cabecera. Las primeras 8 son la paleta real de la cinta; las
+  // 8 restantes no se usan (se dejan a 0, ya estan a 0 por el memset).
+  for (int i = 0; i < 8; i++) {
+    uint8_t *entry = &header[54 + i * 4];
+    entry[0] = PALETTE[i].b;
+    entry[1] = PALETTE[i].g;
+    entry[2] = PALETTE[i].r;
+    entry[3] = 0;
+  }
+
   pageFile.write(header, sizeof(header));
 
   bandBase = 0;
@@ -450,7 +482,7 @@ void openNewPage() {
   bmpCacheBytes = 0; // la cache PSRAM empieza de cero para cada pagina nueva
   cacheAppend(header, sizeof(header));
 
-  patchHeaderNow(); // deja la cabecera (en la SD y en la cache) coherente: 54/0
+  patchHeaderNow(); // deja la cabecera (en la SD y en la cache) coherente: BMP_HEADER_BYTES/0
 
   writingToSD = false;
   updateStatusLed();
@@ -464,18 +496,19 @@ void flushOneRow() {
   // para poder reutilizar ese hueco.
   if (!pageOpen) { bandBase++; return; }
   uint32_t rs = rowSizeBytes();
-  uint8_t rowBuf[PAGE_WIDTH_DOTS * 3 + 3]; // +3: margen para el relleno a multiplo de 4
+  uint8_t rowBuf[PAGE_WIDTH_DOTS / 2 + 4]; // +4: margen para el relleno a multiplo de 4
+  memset(rowBuf, 0, sizeof(rowBuf));
   int32_t rel = bandBase % BAND_HEIGHT;
   if (rel < 0) rel += BAND_HEIGHT;
   for (int x = 0; x < PAGE_WIDTH_DOTS; x++) {
     uint8_t idx = band[rel][x];
-    RGB c = (idx == COLOR_WHITE_INDEX) ? PALETTE[7] : PALETTE[idx];
-    // BMP almacena en orden BGR
-    rowBuf[x*3+0] = c.b;
-    rowBuf[x*3+1] = c.g;
-    rowBuf[x*3+2] = c.r;
+    if (idx == COLOR_WHITE_INDEX) idx = 7; // blanco = entrada 7 de la paleta
+    // 2 pixeles por byte: el primero (x par) va en el nibble alto, el
+    // segundo (x impar) en el nibble bajo -- orden estandar de BMP 4bpp.
+    if (x & 1) rowBuf[x / 2] |= (idx & 0x0F);
+    else       rowBuf[x / 2] |= (idx & 0x0F) << 4;
   }
-  for (uint32_t p = PAGE_WIDTH_DOTS * 3; p < rs; p++) rowBuf[p] = 0; // relleno a multiplo de 4
+  // el resto de rowBuf (relleno a multiplo de 4) ya quedo a 0 por el memset
 
   pageFile.write(rowBuf, rs); // una unica escritura, en vez de datos+relleno por separado
   cacheAppend(rowBuf, rs);
@@ -549,6 +582,7 @@ uint16_t computeAdvanceDots() {
   return advance;
 }
 
+/*
 FontChoice chooseFont() {
   if (!lqMode) {
     return { font5x7, FONT_COLS, FONT_ROWS, FONT_FIRST_CHAR, FONT_LAST_CHAR, 3 };
@@ -557,9 +591,34 @@ FontChoice chooseFont() {
     case 1: // Sans Serif
       return { font5x7, FONT_COLS, FONT_ROWS, FONT_FIRST_CHAR, FONT_LAST_CHAR, 3 };
     default: // Roman, Courier, Prestige, Script, OCR-B, OCR-A -> familia de 8x8
-      return { font8x8, FONT1_COLS, FONT1_ROWS, FONT1_FIRST_CHAR, FONT1_LAST_CHAR, 3 };
+      return { font5x7, FONT_COLS, FONT_ROWS, FONT_FIRST_CHAR, FONT_LAST_CHAR, 3 };
   }
 }
+*/
+FontChoice chooseFont() {
+  if (!lqMode) {
+    return { font5x7, FONT_COLS, FONT_ROWS, FONT_FIRST_CHAR, FONT_LAST_CHAR, 3 };
+  }
+  switch (typefaceMode) {
+    case 0: // Roman
+      return { fontroman, FONT0_COLS, FONT0_ROWS, FONT0_FIRST_CHAR, FONT0_LAST_CHAR, 3 };
+    case 1: // Sans Serif
+      return { font8x8, FONT1_COLS, FONT1_ROWS, FONT1_FIRST_CHAR, FONT1_LAST_CHAR, 3 };
+    case 2: // Courier
+      return { fontcourier, FONT2_COLS, FONT2_ROWS, FONT2_FIRST_CHAR, FONT2_LAST_CHAR, 3 };
+    case 3: // Prestige
+      return { fontprestige, FONT3_COLS, FONT3_ROWS, FONT3_FIRST_CHAR, FONT3_LAST_CHAR, 3 };
+    case 4: // Script
+      return { fontscript, FONT4_COLS, FONT4_ROWS, FONT4_FIRST_CHAR, FONT4_LAST_CHAR, 3 };
+    case 5: // OCR-B
+      return { fontocrb, FONT5_COLS, FONT5_ROWS, FONT5_FIRST_CHAR, FONT5_LAST_CHAR, 3 };
+    case 6: // OCR-A
+      return { fontocra, FONT6_COLS, FONT6_ROWS, FONT6_FIRST_CHAR, FONT6_LAST_CHAR, 3 };
+    default: // Roman, Courier, Prestige, Script, OCR-B, OCR-A -> familia de 8x8
+      return { font5x7, FONT_COLS, FONT_ROWS, FONT_FIRST_CHAR, FONT_LAST_CHAR, 3 };
+  }
+}
+/**/
 
 void drawChar(uint8_t c) {
   FontChoice fc = chooseFont();

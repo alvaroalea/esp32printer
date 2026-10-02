@@ -166,7 +166,7 @@ void streamBmpFile(const char *path) {
 // (solo para la "cola" que no quepa en la cache, si la pagina ha crecido
 // mas alla del presupuesto de WEB_BMP_CACHE_MAX_BYTES) ---
 void streamCurrentBmpCached() {
-  uint32_t totalSize = 54 + rowSizeBytes() * rowsWrittenToFile;
+  uint32_t totalSize = BMP_HEADER_BYTES + rowSizeBytes() * rowsWrittenToFile;
 
   if (!bmpCacheBuffer || bmpCacheBytes == 0) {
     // Sin cache utilizable todavia (placa sin PSRAM, o pagina recien abierta):
@@ -241,7 +241,11 @@ void handleList() {
     while (entry) {
       String name = entry.name();
       if (name.endsWith(".BMP") || name.endsWith(".bmp")) {
-        html += "<li><a href='" + name + "'>" + name + "</a> (" +
+        // entry.name() a veces viene con barra inicial y a veces sin ella
+        // segun la version del core; se normaliza para que el enlace sea
+        // siempre una ruta absoluta valida ("/PAGE0001.BMP").
+        String href = name.startsWith("/") ? name : ("/" + name);
+        html += "<li><a href='" + href + "'>" + name + "</a> (" +
                 String(entry.size()) + " bytes)</li>";
       }
       entry = root.openNextFile();
@@ -251,6 +255,25 @@ void handleList() {
   sdAccessEnd();
   html += "</ul><p><a href='/'>Volver</a></p></body></html>";
   webServer.send(200, "text/html", html);
+}
+
+// --- Sirve cualquier .BMP que exista en la SD por su nombre de fichero
+// (ej. /PAGE0007.BMP), que es a donde apuntan los enlaces de /list. Se
+// registra con onNotFound() porque esos nombres no se conocen de antemano
+// (se van creando segun se imprime), asi que no se puede dar de alta una
+// ruta fija por cada uno con webServer.on() ---
+void handlePossibleBmpFile() {
+  String uri = webServer.uri(); // p.ej. "/PAGE0007.BMP"
+  if (uri.endsWith(".BMP") || uri.endsWith(".bmp")) {
+    sdAccessBegin();
+    bool exists = SD.exists(uri.c_str());
+    sdAccessEnd();
+    if (exists) {
+      streamBmpFile(uri.c_str());
+      return;
+    }
+  }
+  webServer.send(404, "text/plain", "No encontrado: " + uri);
 }
 
 // --- /wifi-reset: olvida la red guardada y reinicia para volver a configurar ---
@@ -292,6 +315,7 @@ void setupWifiOtaWeb() {
   webServer.on("/current.bmp", handleCurrentBmp);
   webServer.on("/list", handleList);
   webServer.on("/wifi-reset", handleWifiReset);
+  webServer.onNotFound(handlePossibleBmpFile); // sirve /PAGEnnnn.BMP (enlaces de /list)
   webServer.begin();
   Serial.println("[WEB] Servidor web escuchando en el puerto 80.");
 }
