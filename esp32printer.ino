@@ -55,7 +55,7 @@
  *     impresoras (Negro/Cian/Magenta/Amarillo + combinaciones), no un
  *     RGB continuo real.
  *
- * Autor: generado para un proyecto de emulacion de impresora sobre ESP32.
+ * Autor: (C) Alvaro Alea Fdz. distribuido bajo licencia GPL 3 o superior.
  * ==========================================================================
  */
 
