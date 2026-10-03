@@ -1,3 +1,4 @@
+//#define IADEVEL
 /*
  * ==========================================================================
  *  Emulador de impresora Epson LQ (24 agujas, color) para ESP32
@@ -78,14 +79,15 @@
 #include <freertos/semphr.h>
 #include "font5x7.h"
 #include "font8x8.h"
-/**/
+#ifndef IADEVEL
 #include "roman.h"
 #include "courier.h"
 #include "prestige.h"
 #include "script.h"
 #include "OCRB.h"
 #include "OCRA.h"
-/**/
+#endif
+
 // ================================ CONFIGURACION ===========================
 
 // --- Tarjeta SD (SPI) --- (pines para ESP32-S3; el S3 no tiene un mapeo
@@ -596,7 +598,7 @@ uint16_t computeAdvanceDots() {
   return advance;
 }
 
-/*
+#ifdef IADEVEL
 FontChoice chooseFont() {
   if (!lqMode) {
     return { font5x7, FONT_COLS, FONT_ROWS, FONT_FIRST_CHAR, FONT_LAST_CHAR, 3 };
@@ -608,7 +610,7 @@ FontChoice chooseFont() {
       return { font5x7, FONT_COLS, FONT_ROWS, FONT_FIRST_CHAR, FONT_LAST_CHAR, 3 };
   }
 }
-*/
+#else
 FontChoice chooseFont() {
   if (!lqMode) {
     return { font5x7, FONT_COLS, FONT_ROWS, FONT_FIRST_CHAR, FONT_LAST_CHAR, 3 };
@@ -632,7 +634,7 @@ FontChoice chooseFont() {
       return { font5x7, FONT_COLS, FONT_ROWS, FONT_FIRST_CHAR, FONT_LAST_CHAR, 3 };
   }
 }
-/**/
+#endif
 
 void drawChar(uint8_t c) {
   FontChoice fc = chooseFont();

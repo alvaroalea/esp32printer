@@ -96,12 +96,12 @@ WebServer webServer(80);
 // --- Pagina principal ---
 void handleRoot() {
   String html = "<!DOCTYPE html><html><head><meta charset='utf-8'>"
-                "<title>Impresora Epson ESP32</title>"
+                "<title>Emulador Impresora ESC/P</title>"
                 "<meta name='viewport' content='width=device-width, initial-scale=1'>"
                 "<style>body{font-family:sans-serif;background:#222;color:#eee;text-align:center}"
                 "img{max-width:95%;border:1px solid #555;margin-top:10px;background:#fff}"
                 "a{color:#8cf}</style></head><body>"
-                "<h2>Impresora Epson (ESP32)</h2>";
+                "<h2>Emulador Impresora ESC/P (ESP32)</h2>";
   if (pageOpen) {
     html += "<p>Imprimiendo ahora: " + String(currentFileName) + "</p>";
   } else if (pageIndex > 0) {
@@ -118,6 +118,7 @@ void handleRoot() {
   }
   html += "<img id='pg' src='/current.bmp' onerror=\"this.style.display='none'\">"
           "<p><a href='/list'>Ver todas las paginas</a> &middot; "
+          "<a href='/current.bmp'>Pagina Actual</a> &middot; "
           "<a href='/wifi-reset'>Reconfigurar WiFi</a></p>"
           "<script>setInterval(function(){"
           "document.getElementById('pg').style.display='';"
