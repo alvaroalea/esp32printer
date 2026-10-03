@@ -89,7 +89,7 @@
 // reintentos con espera NUNCA afectan a la impresora.
 #define WIFI_QUICK_RETRY_COUNT      3    // cuantos intentos rapidos antes de WiFiManager
 #define WIFI_QUICK_RETRY_WAIT_MS    5000 // cuanto se espera a que conecte cada intento
-#define WIFI_QUICK_RETRY_DELAY_MS   3000 // pausa entre un intento fallido y el siguiente
+#define WIFI_QUICK_RETRY_DELAY_MS   5000 // pausa entre un intento fallido y el siguiente
 
 WebServer webServer(80);
 

@@ -38,12 +38,24 @@
  *     (ESC E/F/G/H), subrayado (ESC - n), color de cinta (ESC r n),
  *     tipo de letra (ESC k n), calidad borrador/NLQ (ESC x n), paso
  *     pica/elite/15cpi (ESC P/M/g), condensado (SI/DC2), cursiva
- *     (ESC 4/5), ancho doble (ESC W n) y super/subindice (ESC S/T).
+ *     (ESC 4/5), ancho doble (ESC W n), alto doble/cuadruple (ESC w n,
+ *     ver aviso debajo) y super/subindice (ESC S/T).
  *     Los caracteres definidos por el usuario, tabulaciones verticales,
- *     microavances (ESC J), formato de pagina, doble ALTURA, etc. no
- *     estan implementados; los bytes de parametro de secuencias no
- *     reconocidas se descartan de forma conservadora para no
+ *     microavances (ESC J), formato de pagina, etc. no estan
+ *     implementados; los bytes de parametro de secuencias no
+ *     reconocidas se descartan de forma conservadora (y ahora ademas
+ *     generan una linea de log "[DEBUG] Comando ESC no soportado" con
+ *     el caracter recibido, para poder detectarlas facilmente) para no
  *     desincronizar el interprete.
+ *   - "ESC w n" (alto doble/cuadruple, n=0 normal/1 doble/2 cuadruple) NO
+ *     es un comando ESC/P original de Epson: el ESC/P clasico de
+ *     impresoras matriciales no tiene uno, porque una cabeza de agujas
+ *     fisica no puede imprimir mas alto en una sola pasada (por eso ni
+ *     siquiera el "Master Select", ESC !, lo incluye, aunque si incluye
+ *     el ancho doble). Aqui SI es trivial al ser software, asi que se ha
+ *     anadido como extension propia del emulador, simetrica a ESC W. Si
+ *     el host usa otra secuencia para esto, aparecera en el log de
+ *     depuracion de comandos no soportados y se puede remapear facil.
  *   - Los "tipos de letra" son una aproximacion honesta, no una copia
  *     fiel: solo se dispone de dos fuentes de puntos de dominio publico
  *     verificadas (una de 5x7 tipo palo seco y otra de 8x8 tipo
@@ -91,7 +103,7 @@
 #define SERIAL_RX_PIN 18
 #define SERIAL_RTS_PIN 15   // RTS de salida: avisa al host cuando NO debe seguir enviando
 #define SERIAL_CTS_PIN 16   // CTS de entrada: el host nos dice cuando puede recibir (no usado al imprimir)
-#define SERIAL_BAUD   2400   // Velocidad del puerto serie de la impresora
+#define SERIAL_BAUD   9600   // Velocidad del puerto serie de la impresora
 #define USE_HW_FLOW_CONTROL true  // Control de flujo por hardware RTS/CTS (preferido: hay pines cableados)
 #define USE_XONXOFF   false  // Control de flujo por software (alternativa si no se cablean RTS/CTS)
 
@@ -222,6 +234,7 @@ uint8_t pitchMode    = 0;    // ESC P/M/g : 0=pica(10cpi) 1=elite(12cpi) 2=15cpi
 bool    condensedMode = false; // SI (0x0F) / DC2 (0x12)
 bool    italicMode    = false; // ESC 4 / ESC 5
 bool    doubleWidthMode = false; // ESC W n
+uint8_t heightMultiplier = 1;    // ESC w n (extension propia, ver aviso en la respuesta): 1, 2 o 4
 uint8_t scriptMode    = 0;   // ESC S n / ESC T : 0=normal 1=superindice 2=subindice
 
 unsigned long lastByteMillis = 0;
@@ -260,6 +273,7 @@ enum EscState {
   ST_ESC_K,        // ESC k n           (tipo de letra)
   ST_ESC_X,        // ESC x n           (calidad borrador/NLQ)
   ST_ESC_W,        // ESC W n           (ancho doble on/off)
+  ST_ESC_LOWER_W,  // ESC w n           (alto doble/cuadruple -- extension propia, no ESC/P original)
   ST_ESC_S,        // ESC S n           (superindice/subindice)
   ST_ESC_STAR_M,   // ESC * m ...       (grafico: falta el byte m)
   ST_ESC_STAR_NL,  // ESC * m nL ...
@@ -594,7 +608,7 @@ FontChoice chooseFont() {
       return { font5x7, FONT_COLS, FONT_ROWS, FONT_FIRST_CHAR, FONT_LAST_CHAR, 3 };
   }
 }
-/**/
+*/
 FontChoice chooseFont() {
   if (!lqMode) {
     return { font5x7, FONT_COLS, FONT_ROWS, FONT_FIRST_CHAR, FONT_LAST_CHAR, 3 };
@@ -630,10 +644,10 @@ void drawChar(uint8_t c) {
   uint8_t scaleX = usable / fc.cols;
   if (scaleX < 1) scaleX = 1;
 
-  uint8_t scaleY = fc.baseScaleY;
+  uint8_t scaleY = fc.baseScaleY * heightMultiplier; // ESC w: doble/cuadruple alto (extension propia)
   if (scriptMode != 0) { scaleY = (uint8_t)((scaleY * 2) / 3); if (scaleY < 1) scaleY = 1; }
 
-  uint16_t fullHeight = fc.rows * fc.baseScaleY;   // alto normal (sin super/subindice)
+  uint16_t fullHeight = fc.rows * fc.baseScaleY * heightMultiplier; // alto normal (sin super/subindice, con doble/cuadruple ya aplicado)
   uint16_t thisHeight = fc.rows * scaleY;
   int32_t yBase = cursorY;
   if (scriptMode == 2) yBase = cursorY + (fullHeight - thisHeight); // subindice: alineado abajo
@@ -672,7 +686,18 @@ void drawChar(uint8_t c) {
   }
   if (underlineMode) {
     int32_t y = cursorY + fullHeight - 1; // el subrayado siempre va en la linea base normal
-    for (int x = 0; x < advance; x++) plotDot(cursorX + x, y, currentColor);
+    for (int x = 0; x < advance; x++) {
+      int32_t absX = cursorX + x;
+      // En borrador, igual que el resto del texto, las agujas golpean un
+      // punto si y otro no (ver paintRows mas arriba): el subrayado debe
+      // ser coherente con eso, una linea de puntos en vez de continua. Se
+      // usa la coordenada ABSOLUTA de la pagina (no "x", que es local a
+      // este caracter) para que el patron de puntos siga alineado de un
+      // caracter al siguiente sea cual sea el paso (CPI) actual, en vez de
+      // reiniciarse en cada salto de caracter.
+      if (!lqMode && (absX & 1)) continue;
+      plotDot(absX, y, currentColor);
+    }
   }
 }
 
@@ -691,6 +716,7 @@ void resetPrinterState() {
   condensedMode = false;
   italicMode = false;
   doubleWidthMode = false;
+  heightMultiplier = 1;
   scriptMode = 0;
 }
 
@@ -839,6 +865,7 @@ void handleByteInner(uint8_t b) {
         case 0x0F: condensedMode = true;  escState = ST_NORMAL; return;   // ESC SI: condensado ON
         case 0x12: condensedMode = false; escState = ST_NORMAL; return;   // cancelar condensado
         case 'W': escState = ST_ESC_W; return;                            // ESC W n: ancho doble
+        case 'w': escState = ST_ESC_LOWER_W; return;                      // ESC w n: alto doble/cuadruple (extension propia)
         case '4': italicMode = true;  escState = ST_NORMAL; return;       // cursiva ON
         case '5': italicMode = false; escState = ST_NORMAL; return;       // cursiva OFF
         case 'S': escState = ST_ESC_S; return;                            // ESC S n: super/subindice
@@ -889,6 +916,13 @@ void handleByteInner(uint8_t b) {
       doubleWidthMode = (decodeNumericParam(b) != 0);
       escState = ST_NORMAL;
       return;
+
+    case ST_ESC_LOWER_W: {
+      uint8_t v = decodeNumericParam(b);
+      heightMultiplier = (v == 1) ? 2 : (v == 2) ? 4 : 1; // 0=normal 1=doble 2=cuadruple, cualquier otro valor -> normal
+      escState = ST_NORMAL;
+      return;
+    }
 
     case ST_ESC_S:
       scriptMode = (decodeNumericParam(b) == 0) ? 1 : 2; // 0=superindice, 1=subindice (segun ESC/P)
