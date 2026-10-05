@@ -41,7 +41,11 @@
  *     tipo de letra (ESC k n), calidad borrador/NLQ (ESC x n), paso
  *     pica/elite/15cpi (ESC P/M/g), condensado (SI/DC2), cursiva
  *     (ESC 4/5), ancho doble (ESC W n), alto doble/cuadruple (ESC w n,
- *     ver aviso debajo) y super/subindice (ESC S/T).
+ *     ver aviso debajo) y super/subindice (ESC S/T). Margenes izquierdo y
+ *     derecho (ESC l n / ESC Q n: n columnas del paso (CPI) vigente en el
+ *     momento de fijarlos; despues cambiar el CPI NO los mueve) y salto de
+ *     linea automatico (CR+LF) al llegar al margen derecho, como una
+ *     impresora real, en vez de perder los caracteres sobrantes.
  *     Los caracteres definidos por el usuario, tabulaciones verticales,
  *     microavances (ESC J), formato de pagina, etc. no estan
  *     implementados; los bytes de parametro de secuencias no
@@ -234,6 +238,8 @@ uint32_t rowsWrittenToFile = 0; // filas ya volcadas a la SD para la pagina actu
 
 int32_t cursorX = 0;            // posicion horizontal actual, en puntos (0..PAGE_WIDTH_DOTS-1)
 int32_t cursorY = 0;            // posicion vertical actual dentro de la pagina, en puntos
+int32_t leftMarginDots = 0;                 // ESC l n : margen izquierdo en puntos (ya convertido con el CPI de ese momento)
+int32_t rightMarginDots = PAGE_WIDTH_DOTS;  // ESC Q n : margen derecho en puntos, medido desde el borde izquierdo
 int32_t lineSpacingDots = DEFAULT_LINE_DOTS;
 uint8_t currentColor = 0;       // indice de PALETTE, por defecto negro
 bool boldMode = false;
@@ -300,6 +306,8 @@ enum EscState {
   ST_ESC_3,        // ESC 3 n           (interlineado n/180")
   ST_ESC_MINUS,    // ESC - n           (subrayado on/off)
   ST_ESC_UNDERSCORE, // ESC _ n         (sobrerrayado on/off)
+  ST_ESC_L_MARGIN, // ESC l n           (margen izquierdo, n columnas)
+  ST_ESC_Q_MARGIN, // ESC Q n           (margen derecho, n columnas)
   ST_ESC_K,        // ESC k n           (tipo de letra)
   ST_ESC_X,        // ESC x n           (calidad borrador/NLQ)
   ST_ESC_W,        // ESC W n           (ancho doble on/off)
@@ -515,7 +523,7 @@ void openNewPage() {
   pageFile.write(header, sizeof(header));
 
   bandBase = 0;
-  cursorX = 0;
+  cursorX = leftMarginDots;
   cursorY = 0;
   rowsWrittenToFile = 0;
   pageHasInk = false;
@@ -615,15 +623,23 @@ void finishPageIfNeeded() {
 // fuente 5x7, tal y como hacian las propias impresoras (el modo borrador no
 // distinguia tipografias).
 
-uint16_t computeAdvanceDots() {
+// Ancho en puntos de UNA columna al paso (CPI) vigente, SIN el ancho doble
+// (ESC W): es la unidad en la que se expresan los margenes ESC l / ESC Q.
+uint16_t computeColumnDots() {
   float cpi;
   if (condensedMode) cpi = (pitchMode == 1) ? 20.0f : 17.14f; // condensada elite / pica
   else if (pitchMode == 0) cpi = 10.0f;   // pica
   else if (pitchMode == 1) cpi = 12.0f;   // elite
   else cpi = 15.0f;                       // ESC g
   uint16_t advance = (uint16_t)((180.0f / cpi) + 0.5f);
-  if (doubleWidthMode) advance *= 2;
   if (advance < 4) advance = 4;
+  return advance;
+}
+
+// Avance real de un caracter: la columna, doblada si ESC W esta activo.
+uint16_t computeAdvanceDots() {
+  uint16_t advance = computeColumnDots();
+  if (doubleWidthMode) advance *= 2;
   return advance;
 }
 
@@ -773,6 +789,8 @@ void resetPrinterState() {
   overscoreMode = false;
   lineCellHeight = 0;
   lineMinAdvance = 0;
+  leftMarginDots = 0;
+  rightMarginDots = PAGE_WIDTH_DOTS;
   lineSpacingDots = DEFAULT_LINE_DOTS;
   cursorX = 0;
   cursorY = 0;
@@ -882,10 +900,10 @@ void handleByteInner(uint8_t b) {
       switch (b) {
         case 0x0A: // LF
           doLineFeed();
-          if (AUTO_CR_ON_LF) cursorX = 0;
+          if (AUTO_CR_ON_LF) cursorX = leftMarginDots;
           return;
         case 0x0D: // CR
-          cursorX = 0;
+          cursorX = leftMarginDots;
           if (AUTO_LF_ON_CR) doLineFeed();
           return;
         case 0x0C: // FF
@@ -893,7 +911,7 @@ void handleByteInner(uint8_t b) {
           return;
         case 0x08: // BS
           cursorX -= computeAdvanceDots();
-          if (cursorX < 0) cursorX = 0;
+          if (cursorX < leftMarginDots) cursorX = leftMarginDots;
           return;
         case 0x09: { // HT: tabulador cada 8 celdas de caracter
           int32_t cell = computeAdvanceDots() * 8;
@@ -910,8 +928,23 @@ void handleByteInner(uint8_t b) {
           return;
         default:
           if (b >= 0x20 && b <= 0x7E) {
+            uint16_t adv = computeAdvanceDots();
+            // Salto automatico: si el caracter no cabe antes del margen derecho,
+            // la impresora hace CR+LF (independiente de AUTO_CR_ON_LF, que es
+            // para el LF que manda el host) y lo imprime en la linea siguiente.
+            // Solo se envuelve una vez: si no cupiera ni vacia la linea, se dibuja
+            // igualmente (recortado) en vez de entrar en bucle.
+            if (cursorX + (int32_t)adv > rightMarginDots) {
+              cursorX = leftMarginDots;
+              doLineFeed();
+              if (cursorY >= PAGE_HEIGHT_DOTS) { // el salto acaba la hoja: pagina nueva sin perder el caracter
+                finishPageIfNeeded();
+                openNewPage();
+                cursorX = leftMarginDots;
+              }
+            }
             drawChar(b);
-            cursorX += computeAdvanceDots();
+            cursorX += adv;
           }
           // bytes >= 0x80 (juegos de caracteres extendidos/acentos) no
           // soportados: se ignoran de forma segura en vez de imprimir basura.
@@ -931,6 +964,8 @@ void handleByteInner(uint8_t b) {
         case 'r': escState = ST_ESC_R; return;                            // color de cinta
         case '-': escState = ST_ESC_MINUS; return;                       // subrayado
         case '_': escState = ST_ESC_UNDERSCORE; return;                  // sobrerrayado
+        case 'l': escState = ST_ESC_L_MARGIN; return;                    // ESC l n: margen izquierdo
+        case 'Q': escState = ST_ESC_Q_MARGIN; return;                    // ESC Q n: margen derecho
         case '*': escState = ST_ESC_STAR_M; return;                      // grafico ESC *
         case 'K': startGraphicsCapture(8, 60);  escState = ST_ESC_KLYZ_NL; return;
         case 'L': startGraphicsCapture(8, 120); escState = ST_ESC_KLYZ_NL; return;
@@ -980,6 +1015,24 @@ void handleByteInner(uint8_t b) {
       underlineMode = (decodeNumericParam(b) != 0);
       escState = ST_NORMAL;
       return;
+
+    case ST_ESC_L_MARGIN: { // n columnas (valor binario crudo, como ESC 3) al CPI de AHORA
+      int32_t m = (int32_t)b * computeColumnDots();
+      if (m < rightMarginDots) {           // debe quedar a la izquierda del margen derecho; si no, se ignora
+        leftMarginDots = m;
+        if (cursorX < leftMarginDots) cursorX = leftMarginDots;
+      }
+      escState = ST_NORMAL;
+      return;
+    }
+
+    case ST_ESC_Q_MARGIN: {
+      int32_t m = (int32_t)b * computeColumnDots();
+      if (m > PAGE_WIDTH_DOTS) m = PAGE_WIDTH_DOTS; // mas alla de la hoja: lo maximo posible
+      if (m > leftMarginDots) rightMarginDots = m;  // debe quedar a la derecha del margen izquierdo; si no, se ignora
+      escState = ST_NORMAL;
+      return;
+    }
 
     case ST_ESC_UNDERSCORE:
       overscoreMode = (decodeNumericParam(b) != 0);
