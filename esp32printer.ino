@@ -36,7 +36,8 @@
  *   - Se soporta un subconjunto practico de ESC/P: inicializacion,
  *     avance de linea/pagina, interlineado (ESC 2 / ESC 0 / ESC 3 n),
  *     graficos de puntos (ESC K/L/Y/Z y ESC *), negrita/doble-golpe
- *     (ESC E/F/G/H), subrayado (ESC - n), color de cinta (ESC r n),
+ *     (ESC E/F/G/H), subrayado (ESC - n), sobrerrayado (ESC _ n), color
+ *     de cinta (ESC r n),
  *     tipo de letra (ESC k n), calidad borrador/NLQ (ESC x n), paso
  *     pica/elite/15cpi (ESC P/M/g), condensado (SI/DC2), cursiva
  *     (ESC 4/5), ancho doble (ESC W n), alto doble/cuadruple (ESC w n,
@@ -57,6 +58,10 @@
  *     anadido como extension propia del emulador, simetrica a ESC W. Si
  *     el host usa otra secuencia para esto, aparecera en el log de
  *     depuracion de comandos no soportados y se puede remapear facil.
+ *     Una linea con caracteres de alto doble/cuadruple avanza en el LF lo
+ *     que haga falta para no pisar a la siguiente (nunca menos que el
+ *     interlineado configurado), y los caracteres de distinto alto de una
+ *     misma linea comparten la linea base (ver drawChar()).
  *   - Los "tipos de letra" son una aproximacion honesta, no una copia
  *     fiel: solo se dispone de dos fuentes de puntos de dominio publico
  *     verificadas (una de 5x7 tipo palo seco y otra de 8x8 tipo
@@ -130,7 +135,12 @@
 // para una pagina de tamano normal). Si no hay PSRAM en la placa, esto se
 // desactiva solo y todo se sirve desde la SD como antes.
 #define WEB_BMP_CACHE_MAX_BYTES (2UL * 1024 * 1024) // 2MB: cubre una pagina entera de sobra
-#define BAND_HEIGHT       48     // Alto del buffer de bandas en filas (RAM ~ 1440*48 bytes)
+#define BAND_HEIGHT       128    // Alto del buffer de bandas en filas. DEBE ser mayor que la linea mas alta
+                                  // que pueda dibujarse (5x7 a x4 de alto = 84 filas, 8x8 = 96): con una
+                                  // banda menor, los caracteres altos pierden su parte superior porque
+                                  // ya se han volcado a la SD. 1440*128 = 180KB -> se reserva en PSRAM
+                                  // (ver allocBand()), no como variable estatica.
+#define BAND_BYTES        ((size_t)BAND_HEIGHT * PAGE_WIDTH_DOTS)
 #define DEFAULT_LINE_DOTS 30     // 1/6" a 180dpi = 30 puntos (interlineado por defecto)
 
 // Equivalente por software a los DIP-switch "Auto LF" / "Auto CR" de una
@@ -228,6 +238,7 @@ int32_t lineSpacingDots = DEFAULT_LINE_DOTS;
 uint8_t currentColor = 0;       // indice de PALETTE, por defecto negro
 bool boldMode = false;
 bool underlineMode = false;
+bool overscoreMode = false;     // ESC _ n : linea sobre la primera fila del caracter
 
 // --- Estado tipografico (ver seccion RENDERIZADO DE TEXTO para el detalle) ---
 uint8_t typefaceMode = 1;   // seleccionado por ESC k n (0 Roman,1 Sans Serif,2 Courier,3 Prestige,4 Script,5 OCR-B,6 OCR-A)
@@ -238,6 +249,10 @@ bool    italicMode    = false; // ESC 4 / ESC 5
 bool    doubleWidthMode = false; // ESC W n
 uint8_t heightMultiplier = 1;    // ESC w n (extension propia, ver aviso en la respuesta): 1, 2 o 4
 uint8_t scriptMode    = 0;   // ESC S n / ESC T : 0=normal 1=superindice 2=subindice
+
+// Estado de la LINEA en curso (se reinicia en cada LF / pagina nueva / ESC @):
+uint16_t lineCellHeight = 0;  // alto de la celda mas alta dibujada en esta linea (linea base comun)
+int32_t  lineMinAdvance = 0;  // avance minimo en el LF para no pisar la linea siguiente (solo con alto doble/cuadruple; 0 = usar interlineado)
 
 unsigned long lastByteMillis = 0;
 bool everReceivedByte = false;  // evita que el LED muestre "recibiendo" antes del primer byte real
@@ -261,8 +276,20 @@ uint32_t lastLedColorSet = 0xFFFFFFFF; // sentinela invalido para forzar el prim
 
 // --- Buffer de bandas: filas [bandBase .. bandBase+BAND_HEIGHT-1] en RAM ---
 // band[y % BAND_HEIGHT][x] = indice de color (0..6) o COLOR_WHITE_INDEX si vacio
-static uint8_t band[BAND_HEIGHT][PAGE_WIDTH_DOTS];
+static uint8_t (*band)[PAGE_WIDTH_DOTS] = nullptr; // reservado en setup() por allocBand()
 int32_t bandBase = 0;  // primera fila (coordenada Y absoluta) representada en el buffer
+
+// Reserva el buffer de bandas (BAND_BYTES). Preferentemente en PSRAM; si la
+// placa no la tiene (o esta desactivada en el menu Herramientas del IDE) se
+// intenta en la RAM interna, que con ~180KB puede no caber junto con WiFi.
+void allocBand() {
+  if (psramFound()) band = (uint8_t (*)[PAGE_WIDTH_DOTS])ps_malloc(BAND_BYTES);
+  if (!band)        band = (uint8_t (*)[PAGE_WIDTH_DOTS])malloc(BAND_BYTES);
+  if (!band) {
+    Serial.println("[ERROR] No hay memoria para el buffer de bandas (activa la PSRAM o baja BAND_HEIGHT).");
+    while (true) delay(1000);
+  }
+}
 
 // ================================ MAQUINA DE ESTADOS ESC/P =================
 
@@ -272,6 +299,7 @@ enum EscState {
   ST_ESC_R,        // ESC r n           (color de cinta)
   ST_ESC_3,        // ESC 3 n           (interlineado n/180")
   ST_ESC_MINUS,    // ESC - n           (subrayado on/off)
+  ST_ESC_UNDERSCORE, // ESC _ n         (sobrerrayado on/off)
   ST_ESC_K,        // ESC k n           (tipo de letra)
   ST_ESC_X,        // ESC x n           (calidad borrador/NLQ)
   ST_ESC_W,        // ESC W n           (ancho doble on/off)
@@ -492,7 +520,8 @@ void openNewPage() {
   rowsWrittenToFile = 0;
   pageHasInk = false;
   maxYUsed = -1;
-  memset(band, COLOR_WHITE_INDEX, sizeof(band));
+  memset(band, COLOR_WHITE_INDEX, BAND_BYTES);
+  lineCellHeight = 0; lineMinAdvance = 0; // linea nueva arriba de la hoja
   pageOpen = true;
 
   bmpCacheBytes = 0; // la cache PSRAM empieza de cero para cada pagina nueva
@@ -636,6 +665,21 @@ FontChoice chooseFont() {
 }
 #endif
 
+// Linea horizontal de subrayado / sobrerrayado a lo ancho de la celda del
+// caracter actual (cursorX .. cursorX+advance-1), de 'thick' filas desde yTop.
+// NLQ: continua. Borrador: a "golpes de aguja" del MISMO tamano que los puntos
+// de los caracteres (dotW = ancho de un punto de la fuente: ~3 px a 10 cpi,
+// 2 a 12 cpi...), un golpe si y un hueco igual, usando la X ABSOLUTA de la
+// pagina para que el patron siga sin cortes de un caracter al siguiente.
+void drawScoreLine(int32_t yTop, uint16_t advance, uint8_t dotW, uint8_t thick) {
+  if (dotW < 1) dotW = 1;
+  for (int x = 0; x < advance; x++) {
+    int32_t absX = cursorX + x;
+    if (!lqMode && ((absX / dotW) & 1)) continue;
+    for (uint8_t t = 0; t < thick; t++) plotDot(absX, yTop + t, currentColor);
+  }
+}
+
 void drawChar(uint8_t c) {
   FontChoice fc = chooseFont();
   if (c < fc.firstChar || c > fc.lastChar) c = ' ';
@@ -646,13 +690,35 @@ void drawChar(uint8_t c) {
   uint8_t scaleX = usable / fc.cols;
   if (scaleX < 1) scaleX = 1;
 
-  uint8_t scaleY = fc.baseScaleY * heightMultiplier; // ESC w: doble/cuadruple alto (extension propia)
+  // ESC w: doble/cuadruple alto (extension propia). La linea mas alta debe
+  // caber en el buffer de bandas (BAND_HEIGHT): si no cabe, se reduce el factor
+  // en vez de perder la parte superior del caracter.
+  uint8_t hMul = heightMultiplier;
+  while (hMul > 1 && (int)fc.rows * fc.baseScaleY * hMul > BAND_HEIGHT - 4) hMul--;
+
+  uint8_t scaleY = fc.baseScaleY * hMul;
+  uint8_t normalScaleY = scaleY; // sin la reduccion de super/subindice (para el grosor de subrayado/sobrerrayado)
   if (scriptMode != 0) { scaleY = (uint8_t)((scaleY * 2) / 3); if (scaleY < 1) scaleY = 1; }
 
-  uint16_t fullHeight = fc.rows * fc.baseScaleY * heightMultiplier; // alto normal (sin super/subindice, con doble/cuadruple ya aplicado)
+  uint16_t normalHeight = fc.rows * fc.baseScaleY;       // alto sin ESC w
+  uint16_t fullHeight = fc.rows * fc.baseScaleY * hMul;  // alto normal (sin super/subindice, con doble/cuadruple ya aplicado)
   uint16_t thisHeight = fc.rows * scaleY;
-  int32_t yBase = cursorY;
-  if (scriptMode == 2) yBase = cursorY + (fullHeight - thisHeight); // subindice: alineado abajo
+
+  // Linea base comun: la celda de la linea tiene el alto del caracter mas alto
+  // dibujado hasta ahora en ella (lineCellHeight), y cada caracter se alinea por
+  // ABAJO en esa celda. Con texto de un solo tamano no cambia nada (celda = alto
+  // del caracter). Limitacion: un caracter pequeno dibujado ANTES de uno mas
+  // alto en la misma linea ya no se puede mover y queda alineado arriba.
+  if (fullHeight > lineCellHeight) lineCellHeight = fullHeight;
+  if (hMul > 1) {
+    // La linea necesita al menos su alto + el mismo margen que hay entre una
+    // linea normal y el interlineado; asi el LF no hace pisarse las lineas.
+    int32_t gap = (lineSpacingDots > normalHeight) ? (lineSpacingDots - normalHeight) : 0;
+    if (fullHeight + gap > lineMinAdvance) lineMinAdvance = fullHeight + gap;
+  }
+  int32_t cellTop = cursorY + (lineCellHeight - fullHeight);
+  int32_t yBase = cellTop;
+  if (scriptMode == 2) yBase = cellTop + (fullHeight - thisHeight); // subindice: alineado abajo
 
   // Cursiva por cizalladura continua: cada fila del caracter se desplaza un
   // poco mas hacia la derecha cuanto mas arriba esta (fila 0 = la de mas
@@ -686,20 +752,15 @@ void drawChar(uint8_t c) {
       }
     }
   }
-  if (underlineMode) {
-    int32_t y = cursorY + fullHeight - 1; // el subrayado siempre va en la linea base normal
-    for (int x = 0; x < advance; x++) {
-      int32_t absX = cursorX + x;
-      // En borrador, igual que el resto del texto, las agujas golpean un
-      // punto si y otro no (ver paintRows mas arriba): el subrayado debe
-      // ser coherente con eso, una linea de puntos en vez de continua. Se
-      // usa la coordenada ABSOLUTA de la pagina (no "x", que es local a
-      // este caracter) para que el patron de puntos siga alineado de un
-      // caracter al siguiente sea cual sea el paso (CPI) actual, en vez de
-      // reiniciarse en cada salto de caracter.
-      if (!lqMode && (absX & 1)) continue;
-      plotDot(absX, y, currentColor);
-    }
+  if (underlineMode || overscoreMode) {
+    // Grosor: en NLQ 1 fila (linea continua); en borrador la misma altura que
+    // un golpe de aguja de los caracteres (paintRows de un caracter normal:
+    // 1 fila a 10 cpi sin ESC w, mas con alto doble/cuadruple).
+    uint8_t lineThick = lqMode ? 1 : (uint8_t)max(1, normalScaleY / 2);
+    if (underlineMode)  // subrayado: ultima fila(s) de la celda (linea base normal)
+      drawScoreLine(cellTop + fullHeight - lineThick, advance, scaleX, lineThick);
+    if (overscoreMode)  // sobrerrayado: primera fila(s) de la celda del caracter
+      drawScoreLine(cellTop, advance, scaleX, lineThick);
   }
 }
 
@@ -709,6 +770,9 @@ void resetPrinterState() {
   currentColor = 0;
   boldMode = false;
   underlineMode = false;
+  overscoreMode = false;
+  lineCellHeight = 0;
+  lineMinAdvance = 0;
   lineSpacingDots = DEFAULT_LINE_DOTS;
   cursorX = 0;
   cursorY = 0;
@@ -792,6 +856,18 @@ uint8_t decodeNumericParam(uint8_t b) {
   return b;                                    // valor binario crudo
 }
 
+// Salto de linea: avanza el interlineado configurado, o mas si la linea que
+// se cierra contenia caracteres de alto doble/cuadruple (que no cabrian y se
+// pisarian con la linea siguiente). Con texto normal lineMinAdvance es 0 y
+// el comportamiento es el de siempre.
+void doLineFeed() {
+  int32_t adv = lineSpacingDots;
+  if (lineMinAdvance > adv) adv = lineMinAdvance;
+  cursorY += adv;
+  lineCellHeight = 0;
+  lineMinAdvance = 0;
+}
+
 void handleByteInner(uint8_t b) {
   lastByteMillis = millis();
   everReceivedByte = true;
@@ -805,12 +881,12 @@ void handleByteInner(uint8_t b) {
       if (b == 0x1B) { escState = ST_ESC; return; }
       switch (b) {
         case 0x0A: // LF
-          cursorY += lineSpacingDots;
+          doLineFeed();
           if (AUTO_CR_ON_LF) cursorX = 0;
           return;
         case 0x0D: // CR
           cursorX = 0;
-          if (AUTO_LF_ON_CR) cursorY += lineSpacingDots;
+          if (AUTO_LF_ON_CR) doLineFeed();
           return;
         case 0x0C: // FF
           finishPageIfNeeded();
@@ -854,6 +930,7 @@ void handleByteInner(uint8_t b) {
         case 'H': boldMode = false; escState = ST_NORMAL; return;         // doble golpe OFF
         case 'r': escState = ST_ESC_R; return;                            // color de cinta
         case '-': escState = ST_ESC_MINUS; return;                       // subrayado
+        case '_': escState = ST_ESC_UNDERSCORE; return;                  // sobrerrayado
         case '*': escState = ST_ESC_STAR_M; return;                      // grafico ESC *
         case 'K': startGraphicsCapture(8, 60);  escState = ST_ESC_KLYZ_NL; return;
         case 'L': startGraphicsCapture(8, 120); escState = ST_ESC_KLYZ_NL; return;
@@ -901,6 +978,11 @@ void handleByteInner(uint8_t b) {
 
     case ST_ESC_MINUS:
       underlineMode = (decodeNumericParam(b) != 0);
+      escState = ST_NORMAL;
+      return;
+
+    case ST_ESC_UNDERSCORE:
+      overscoreMode = (decodeNumericParam(b) != 0);
       escState = ST_NORMAL;
       return;
 
@@ -1142,7 +1224,8 @@ void setup() {
     Serial2.setHwFlowCtrlMode(UART_HW_FLOWCTRL_CTS_RTS, 64);
   }
 
-  memset(band, COLOR_WHITE_INDEX, sizeof(band));
+  allocBand(); // antes de tocar band[]
+  memset(band, COLOR_WHITE_INDEX, BAND_BYTES);
   resetPrinterState();
   lastByteMillis = millis();
 
