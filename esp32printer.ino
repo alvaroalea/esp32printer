@@ -52,6 +52,11 @@
  *     (LINE_BUFFER_CHARS) que se dibuja al terminar la linea (LF, CR, FF,
  *     salto automatico, grafico, boton...). Eso permite alinear, tener una
  *     linea base comun real aunque se mezclen alturas, y borrar con CAN/DEL.
+ *     ESC h n: ancho Y alto doble/cuadruple con un solo comando (n=1 doble,
+ *     n=2 cuadruple) y, como extension propia, n=4..7 = imprimir SOLO LA MITAD
+ *     superior (4,6) o inferior (5,7) del caracter ampliado: la linea no crece
+ *     (mitad de un doble = alto normal) y los caracteres salen el doble de
+ *     anchos; sirve para carteles a dos colores (tabla ESC_H_* mas abajo).
  *     Los caracteres definidos por el usuario, tabulaciones verticales,
  *     microavances (ESC J), formato de pagina, etc. no estan
  *     implementados; los bytes de parametro de secuencias no
@@ -163,7 +168,7 @@
 #define AUTO_LF_ON_CR  false  // CR (0x0D) tambien hace un salto de linea
 #define AUTO_CR_ON_LF  true   // LF (0x0A) tambien vuelve al margen izquierdo
 #define IDLE_TIMEOUT_MS   600000UL  // 10 minutos. millis() es un unsigned long de 32 bits
-#define LINE_BUFFER_CHARS 512       // caracteres que caben en el buffer de linea (>=256; 8 bytes cada uno = 4KB). Si se llena, se dibuja lo acumulado y se sigue.
+#define LINE_BUFFER_CHARS 512       // caracteres que caben en el buffer de linea (>=256; 10 bytes cada uno = 5KB). Si se llena, se dibuja lo acumulado y se sigue.
 #define LINE_IDLE_FLUSH_MS 3000UL   // si el host se calla este tiempo con texto sin terminar (sin LF/CR/FF), se dibuja igualmente
 #define DEL_CLEARS_WHOLE_LINE false // DEL (0x7F): false = borra solo el ULTIMO caracter del buffer (ESC/P real); true = borra todo el buffer como CAN
 #define ESC_R_RESETS_TABS  true     // ESC R sin parametro = restaurar tabuladores de fabrica (modo IBM/Epson). false = ESC R n (juego internacional de caracteres, n se descarta)
@@ -207,11 +212,12 @@ struct LineChar {
   int16_t x;        // posicion X logica (puntos) donde se imprimiria sin alinear
   uint8_t ch;
   uint8_t color;
-  uint8_t flags;    // bit0 negrita, bit1 subrayado, bit2 sobrerrayado, bit3 cursiva, bit4 NLQ, bit5 ancho doble, bit6 condensado
+  uint8_t flags;    // bit0 negrita, bit1 subrayado, bit2 sobrerrayado, bit3 cursiva, bit4 NLQ, (bit5 libre), bit6 condensado
   uint8_t typeface;
   uint8_t pitch;
   uint8_t hMul;     // heightMultiplier (ESC w)
   uint8_t script;   // scriptMode
+  uint8_t wh;       // bits0-1: log2 del multiplicador de ancho (1/2/4); bits2-3: halfMode (ESC h 4..7)
 };
 
 // Declaraciones adelantadas: el codigo de escritura en SD (mas abajo) necesita
@@ -274,7 +280,8 @@ bool    lqMode       = false; // ESC x n : false=borrador (draft), true=NLQ/cali
 uint8_t pitchMode    = 0;    // ESC P/M/g : 0=pica(10cpi) 1=elite(12cpi) 2=15cpi
 bool    condensedMode = false; // SI (0x0F) / DC2 (0x12)
 bool    italicMode    = false; // ESC 4 / ESC 5
-bool    doubleWidthMode = false; // ESC W n
+uint8_t widthMultiplier = 1;     // ESC W n (1 o 2) y ESC h n (1, 2 o 4): ancho de caracter respecto al paso (CPI) vigente
+uint8_t halfMode = 0;            // ESC h 4..7 (extension propia): 0 = caracter entero, 1 = solo mitad superior, 2 = solo mitad inferior
 uint8_t heightMultiplier = 1;    // ESC w n (extension propia, ver aviso en la respuesta): 1, 2 o 4
 uint8_t scriptMode    = 0;   // ESC S n / ESC T : 0=normal 1=superindice 2=subindice
 
@@ -346,6 +353,7 @@ enum EscState {
   ST_ESC_L_MARGIN, // ESC l n           (margen izquierdo, n columnas)
   ST_ESC_Q_MARGIN, // ESC Q n           (margen derecho, n columnas)
   ST_ESC_A,        // ESC a n           (justificacion)
+  ST_ESC_H,        // ESC h n           (ancho+alto doble/cuadruple; 4..7 = medio caracter)
   ST_ESC_D,        // ESC D n1..nk NUL  (tabuladores horizontales)
   ST_ESC_E_M,      // ESC e m n         (incremento fijo de tabulador: m)
   ST_ESC_E_N,      //                   (n)
@@ -686,10 +694,10 @@ uint16_t computeColumnDots() {
   return advance;
 }
 
-// Avance real de un caracter: la columna, doblada si ESC W esta activo.
+// Avance real de un caracter: la columna por el multiplicador de ancho (ESC W / ESC h).
 uint16_t computeAdvanceDots() {
   uint16_t advance = computeColumnDots();
-  if (doubleWidthMode) advance *= 2;
+  advance *= widthMultiplier;
   return advance;
 }
 
@@ -739,6 +747,23 @@ uint8_t effectiveHeightMul(FontChoice fc) {
   return m;
 }
 
+// ESC h n : tamano de ancho+alto de una vez. n=0,1,2 como la Epson (normal, doble, cuadruple);
+// n=4..7 es EXTENSION PROPIA: solo se imprime la mitad superior (halfMode 1) o inferior (2) del
+// caracter ya ampliado (doble: 4 sup / 5 inf; cuadruple: 6 sup / 7 inf). n=3 y >7 no estan
+// definidos (se ignoran con aviso DEBUG). Para remapear los codigos basta con tocar esta tabla.
+const uint8_t ESC_H_WMUL[8] = {1, 2, 4, 0, 2, 2, 4, 4}; // multiplicador de ancho (0 = n indefinido)
+const uint8_t ESC_H_HMUL[8] = {1, 2, 4, 0, 2, 2, 4, 4}; // multiplicador de alto
+const uint8_t ESC_H_HALF[8] = {0, 0, 0, 0, 1, 2, 1, 2}; // 0 entero, 1 mitad superior, 2 mitad inferior
+
+// Alto que ocupa el caracter actual en la linea (su "celda"): el del caracter ampliado entero o,
+// con medio caracter (ESC h 4..7), la mitad superior o inferior de ese alto.
+uint16_t charCellHeight(FontChoice fc) {
+  uint8_t m = effectiveHeightMul(fc);
+  uint16_t full = (uint16_t)fc.rows * fc.baseScaleY * m;
+  if (halfMode != 0 && m > 1) return (halfMode == 1) ? full / 2 : full - full / 2;
+  return full;
+}
+
 // Linea horizontal de subrayado / sobrerrayado a lo ancho de la celda del
 // caracter actual (cursorX .. cursorX+advance-1), de 'thick' filas desde yTop.
 // NLQ: continua. Borrador: a "golpes de aguja" del MISMO tamano que los puntos
@@ -774,24 +799,35 @@ void drawChar(uint8_t c) {
   if (scriptMode != 0) { scaleY = (uint8_t)((scaleY * 2) / 3); if (scaleY < 1) scaleY = 1; }
 
   uint16_t normalHeight = fc.rows * fc.baseScaleY;       // alto sin ESC w
-  uint16_t fullHeight = fc.rows * fc.baseScaleY * hMul;  // alto normal (sin super/subindice, con doble/cuadruple ya aplicado)
+  uint16_t fullHeight = fc.rows * fc.baseScaleY * hMul;  // alto del caracter ENTERO (sin super/subindice, con doble/cuadruple ya aplicado)
   uint16_t thisHeight = fc.rows * scaleY;
 
-  // Linea base comun: la celda de la linea tiene el alto del caracter mas alto
-  // dibujado hasta ahora en ella (lineCellHeight), y cada caracter se alinea por
-  // ABAJO en esa celda. Con texto de un solo tamano no cambia nada (celda = alto
-  // del caracter). Limitacion: un caracter pequeno dibujado ANTES de uno mas
-  // alto en la misma linea ya no se puede mover y queda alineado arriba.
-  if (fullHeight > lineCellHeight) lineCellHeight = fullHeight;
-  if (hMul > 1) {
+  // Medio caracter (ESC h 4..7): se dibuja solo la mitad superior o inferior del
+  // caracter ya ampliado. winStart/winEnd = ventana visible en filas del caracter
+  // entero; layoutHeight = lo que ocupa en la linea (ver charCellHeight()).
+  bool halfActive = (halfMode != 0 && hMul > 1);
+  uint16_t winStart = 0, winEnd = fullHeight;
+  if (halfActive) {
+    if (halfMode == 1) winEnd = fullHeight / 2;
+    else               winStart = fullHeight / 2;
+  }
+  uint16_t layoutHeight = winEnd - winStart;
+  uint16_t scriptOffset = (scriptMode == 2) ? (fullHeight - thisHeight) : 0; // subindice: alineado abajo dentro del caracter entero
+
+  // Linea base comun: la celda de la linea tiene el alto de la celda mas alta de
+  // la linea (lineCellHeight; flushLineBuffer() ya la ha medido entera), y cada
+  // caracter se alinea por ABAJO en esa celda. Con texto de un solo tamano no
+  // cambia nada (celda = alto del caracter).
+  if (layoutHeight > lineCellHeight) lineCellHeight = layoutHeight;
+  if (layoutHeight > normalHeight) {
     // La linea necesita al menos su alto + el mismo margen que hay entre una
     // linea normal y el interlineado; asi el LF no hace pisarse las lineas.
+    // (La mitad de un doble mide lo mismo que un normal: no crece.)
     int32_t gap = (lineSpacingDots > normalHeight) ? (lineSpacingDots - normalHeight) : 0;
-    if (fullHeight + gap > lineMinAdvance) lineMinAdvance = fullHeight + gap;
+    if (layoutHeight + gap > lineMinAdvance) lineMinAdvance = layoutHeight + gap;
   }
-  int32_t cellTop = cursorY + (lineCellHeight - fullHeight);
-  int32_t yBase = cellTop;
-  if (scriptMode == 2) yBase = cellTop + (fullHeight - thisHeight); // subindice: alineado abajo
+  int32_t cellTop = cursorY + (lineCellHeight - layoutHeight);
+  int32_t yBase = cellTop - winStart + scriptOffset; // y de la fila 0 del glifo (la ventana empieza en cellTop)
 
   // Cursiva por cizalladura continua: cada fila del caracter se desplaza un
   // poco mas hacia la derecha cuanto mas arriba esta (fila 0 = la de mas
@@ -816,6 +852,10 @@ void drawChar(uint8_t c) {
       if (!(colBits & (1 << row))) continue;
       int8_t xShear = italicMode ? (int8_t)(italicShearMax - row) : 0;
       for (int sy = 0; sy < paintRows; sy++) {
+        if (halfActive) { // solo la parte del caracter entero que cae dentro de la ventana
+          int32_t yRel = scriptOffset + row * scaleY + sy;
+          if (yRel < winStart || yRel >= winEnd) continue;
+        }
         for (int sx = 0; sx < scaleX; sx++) {
           int32_t x = cursorX + col * scaleX + sx + xShear;
           int32_t y = yBase + row * scaleY + sy;
@@ -830,9 +870,10 @@ void drawChar(uint8_t c) {
     // un golpe de aguja de los caracteres (paintRows de un caracter normal:
     // 1 fila a 10 cpi sin ESC w, mas con alto doble/cuadruple).
     uint8_t lineThick = lqMode ? 1 : (uint8_t)max(1, normalScaleY / 2);
-    if (underlineMode)  // subrayado: ultima fila(s) de la celda (linea base normal)
-      drawScoreLine(cellTop + fullHeight - lineThick, advance, scaleX, lineThick);
-    if (overscoreMode)  // sobrerrayado: primera fila(s) de la celda del caracter
+    // Con medio caracter, el subrayado es del caracter ENTERO y solo cae en la mitad inferior; el sobrerrayado en la superior.
+    if (underlineMode && !(halfActive && halfMode == 1))  // subrayado: ultima fila(s) de la celda (linea base normal)
+      drawScoreLine(cellTop + layoutHeight - lineThick, advance, scaleX, lineThick);
+    if (overscoreMode && !(halfActive && halfMode == 2))  // sobrerrayado: primera fila(s) de la celda del caracter
       drawScoreLine(cellTop, advance, scaleX, lineThick);
   }
 }
@@ -855,11 +896,12 @@ void lineBufPush(uint8_t ch) {
   lc.ch = ch;
   lc.color = currentColor;
   lc.flags = (boldMode ? 1 : 0) | (underlineMode ? 2 : 0) | (overscoreMode ? 4 : 0) | (italicMode ? 8 : 0) |
-             (lqMode ? 16 : 0) | (doubleWidthMode ? 32 : 0) | (condensedMode ? 64 : 0);
+             (lqMode ? 16 : 0) | (condensedMode ? 64 : 0);
   lc.typeface = typefaceMode;
   lc.pitch = pitchMode;
   lc.hMul = heightMultiplier;
   lc.script = scriptMode;
+  lc.wh = (widthMultiplier == 4 ? 2 : widthMultiplier == 2 ? 1 : 0) | (halfMode << 2);
 }
 
 // Carga en las variables de estado "vivas" los atributos del caracter i del
@@ -868,8 +910,9 @@ void applyLineChar(uint16_t i) {
   const LineChar &lc = lineBuf[i];
   currentColor = lc.color;
   boldMode = lc.flags & 1;       underlineMode = lc.flags & 2;  overscoreMode = lc.flags & 4;
-  italicMode = lc.flags & 8;     lqMode = lc.flags & 16;        doubleWidthMode = lc.flags & 32;
+  italicMode = lc.flags & 8;     lqMode = lc.flags & 16;
   condensedMode = lc.flags & 64;
+  widthMultiplier = 1 << (lc.wh & 3);  halfMode = lc.wh >> 2;
   typefaceMode = lc.typeface;    pitchMode = lc.pitch;
   heightMultiplier = lc.hMul;    scriptMode = lc.script;
 }
@@ -881,8 +924,8 @@ void flushLineBuffer() {
 
   // Estado vivo que hay que devolver intacto al terminar
   int32_t sX = cursorX; uint8_t sColor = currentColor;
-  bool sBold = boldMode, sUl = underlineMode, sOs = overscoreMode, sIt = italicMode, sLq = lqMode, sDw = doubleWidthMode, sCond = condensedMode;
-  uint8_t sFace = typefaceMode, sPitch = pitchMode, sHMul = heightMultiplier, sScript = scriptMode;
+  bool sBold = boldMode, sUl = underlineMode, sOs = overscoreMode, sIt = italicMode, sLq = lqMode, sCond = condensedMode;
+  uint8_t sFace = typefaceMode, sPitch = pitchMode, sHMul = heightMultiplier, sScript = scriptMode, sWMul = widthMultiplier, sHalf = halfMode;
 
   // 1) Medir: celda mas alta de la linea y extension horizontal. Los espacios
   //    del final no cuentan para centrar/alinear (no son parte visible del texto).
@@ -893,7 +936,7 @@ void flushLineBuffer() {
   for (uint16_t i = 0; i < n; i++) {
     applyLineChar(i);
     FontChoice fc = chooseFont();
-    uint16_t h = fc.rows * fc.baseScaleY * effectiveHeightMul(fc);
+    uint16_t h = charCellHeight(fc); // alto de celda de ESTE caracter (mitad si es medio caracter)
     if (h > cell) cell = h;
     if ((int16_t)i <= lastInk) {
       int32_t l = lineBuf[i].x, r = l + computeAdvanceDots();
@@ -920,8 +963,8 @@ void flushLineBuffer() {
   }
 
   cursorX = sX; currentColor = sColor;
-  boldMode = sBold; underlineMode = sUl; overscoreMode = sOs; italicMode = sIt; lqMode = sLq; doubleWidthMode = sDw; condensedMode = sCond;
-  typefaceMode = sFace; pitchMode = sPitch; heightMultiplier = sHMul; scriptMode = sScript;
+  boldMode = sBold; underlineMode = sUl; overscoreMode = sOs; italicMode = sIt; lqMode = sLq; condensedMode = sCond;
+  typefaceMode = sFace; pitchMode = sPitch; heightMultiplier = sHMul; scriptMode = sScript; widthMultiplier = sWMul; halfMode = sHalf;
 }
 
 // ================================ MAQUINA DE ESTADOS: PROCESADO =============
@@ -943,7 +986,8 @@ void resetPrinterState() {
   pitchMode = 0;
   condensedMode = false;
   italicMode = false;
-  doubleWidthMode = false;
+  widthMultiplier = 1;
+  halfMode = 0;
   heightMultiplier = 1;
   scriptMode = 0;
   lineBufCount = 0;
@@ -1158,6 +1202,7 @@ void handleByteInner(uint8_t b) {
         case 'l': escState = ST_ESC_L_MARGIN; return;                    // ESC l n: margen izquierdo
         case 'Q': escState = ST_ESC_Q_MARGIN; return;                    // ESC Q n: margen derecho
         case 'a': escState = ST_ESC_A; return;                           // ESC a n: justificacion
+        case 'h': escState = ST_ESC_H; return;                           // ESC h n: ancho+alto de una vez / medio caracter
         case 'D': hTabCount = 0; hTabMode = 1; escState = ST_ESC_D; return; // ESC D n1..nk NUL: tabuladores (cancela los anteriores)
         case 'e': escState = ST_ESC_E_M; return;                         // ESC e m n: incremento fijo de tabulador
         case 'f': escState = ST_ESC_F_M; return;                         // ESC f m n: salto horizontal/vertical
@@ -1231,6 +1276,19 @@ void handleByteInner(uint8_t b) {
       int32_t m = (int32_t)b * computeColumnDots();
       if (m > PAGE_WIDTH_DOTS) m = PAGE_WIDTH_DOTS; // mas alla de la hoja: lo maximo posible
       if (m > leftMarginDots) rightMarginDots = m;  // debe quedar a la derecha del margen izquierdo; si no, se ignora
+      escState = ST_NORMAL;
+      return;
+    }
+
+    case ST_ESC_H: { // ver tabla ESC_H_*: 0 normal, 1 doble, 2 cuadruple, 4/5 doble sup/inf, 6/7 cuadruple sup/inf
+      uint8_t v = decodeNumericParam(b);
+      if (v < 8 && ESC_H_WMUL[v] != 0) {
+        widthMultiplier = ESC_H_WMUL[v];
+        heightMultiplier = ESC_H_HMUL[v];
+        halfMode = ESC_H_HALF[v];
+      } else {
+        Serial.printf("[DEBUG] ESC h %u no definido: se ignora\n", v);
+      }
       escState = ST_NORMAL;
       return;
     }
@@ -1314,13 +1372,14 @@ void handleByteInner(uint8_t b) {
       return;
 
     case ST_ESC_W:
-      doubleWidthMode = (decodeNumericParam(b) != 0);
+      widthMultiplier = (decodeNumericParam(b) != 0) ? 2 : 1;
       escState = ST_NORMAL;
       return;
 
     case ST_ESC_LOWER_W: {
       uint8_t v = decodeNumericParam(b);
       heightMultiplier = (v == 1) ? 2 : (v == 2) ? 4 : 1; // 0=normal 1=doble 2=cuadruple, cualquier otro valor -> normal
+      halfMode = 0;                                       // ESC w siempre es caracter entero (los medios caracteres se piden con ESC h 4..7)
       escState = ST_NORMAL;
       return;
     }
