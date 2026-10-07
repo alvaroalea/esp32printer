@@ -383,14 +383,13 @@ EscState escState = ST_NORMAL;
 // Parametros en curso para los modos de grafico
 uint8_t  gfxPins;          // 8 o 24 agujas
 uint8_t  gfxBytesPerCol;   // 1 u 3 bytes por columna
-uint8_t  gfxStepDots;      // avance horizontal (en puntos de 180dpi) por columna
+uint16_t gfxDpi = 180;     // resolucion horizontal del grafico en curso (dpi)
+int32_t  gfxX0 = 0;        // X en la que empezo el bloque (cursorX al recibir el comando)
+uint8_t  gfxDotH = 1;      // alto en puntos de 180dpi de un punto del grafico: 1 (24 agujas) o 3 (8 agujas a 1/60")
 uint16_t gfxNumCols;       // numero total de columnas a recibir
 uint16_t gfxColIndex;      // columna actual recibida
 uint8_t  gfxColBuf[3];     // bytes acumulados de la columna en curso
 uint8_t  gfxColBufPos;
-uint8_t  gfxMergeFactor;   // nº de columnas de origen que se combinan (OR) en 1 punto de salida
-uint8_t  gfxMergeCount;    // columnas ya combinadas en el acumulador actual
-uint8_t  gfxMergeAccum[3]; // acumulador de la fusion (para modos >180dpi, p.ej. 360dpi)
 
 // Tabla de modos ESC * m -> {agujas, dpi_horizontal}
 GfxMode lookupStarMode(uint8_t m) {
@@ -998,59 +997,40 @@ void resetPrinterState() {
 void startGraphicsCapture(uint8_t pins, uint16_t dpi) {
   gfxPins = pins;
   gfxBytesPerCol = (pins == 24) ? 3 : 1;
-  if (dpi > 180) {
-    // Mas denso que nuestra rejilla de 180dpi (p.ej. 360dpi): se combinan
-    // por OR varias columnas de origen en un unico punto de salida, en vez
-    // de "estirar" la imagen avanzando 1 punto por cada columna de origen.
-    gfxMergeFactor = (uint8_t)((dpi / 180.0) + 0.5);
-    if (gfxMergeFactor < 1) gfxMergeFactor = 1;
-    gfxStepDots = 1;
-  } else {
-    // Menos denso (60/90/120dpi): el cabezal golpea un punto y avanza mas
-    // de 1 punto de nuestra rejilla antes del siguiente, dejando huecos
-    // reales entre columnas (asi se comporta tambien la impresora fisica).
-    gfxMergeFactor = 1;
-    uint16_t step = (uint16_t)((180.0 / dpi) + 0.5);
-    if (step < 1) step = 1;
-    gfxStepDots = step;
-  }
-  gfxMergeCount = 0;
-  memset(gfxMergeAccum, 0, sizeof(gfxMergeAccum));
+  gfxDpi = (dpi == 0) ? 180 : dpi;
+  gfxX0 = cursorX;
+  gfxDotH = (pins == 24) ? 1 : 3; // 24 agujas: 1 punto por aguja (1/180"); 8 agujas: 1/60" = 3 puntos
 }
 
-void plotMergedColumn() {
-  // gfxMergeAccum contiene 1 o 3 bytes ya combinados (MSB = aguja superior de cada byte)
+// Dibuja la columna de origen gfxColIndex (ya recibida en gfxColBuf). Cada punto
+// del grafico ocupa su celda REAL en nuestra rejilla de 180dpi, no un unico pixel:
+//  - ancho: de c*180/dpi a (c+1)*180/dpi (por posicion, no por paso entero, asi
+//    80/72/120/144dpi no acumulan error y un bloque 0xFF sale sin huecos). Si dpi>180
+//    (240, 360) varias columnas de origen caen en el mismo punto: se fusionan (OR).
+//  - alto: gfxDotH filas por aguja (3 en 8 agujas, 1 en 24).
+void plotGraphicsColumn() {
+  int32_t c = gfxColIndex;
+  int32_t xa = gfxX0 + (c * 180) / gfxDpi;
+  int32_t xb = gfxX0 + ((c + 1) * 180) / gfxDpi;
+  if (xb <= xa) xb = xa + 1;
   for (int b = 0; b < gfxBytesPerCol; b++) {
-    uint8_t byteVal = gfxMergeAccum[b];
+    uint8_t byteVal = gfxColBuf[b];            // MSB = aguja superior de cada byte
     for (int bit = 0; bit < 8; bit++) {
-      if (byteVal & (0x80 >> bit)) {
-        int pinIndex = b * 8 + bit;         // 0..7 (8 agujas) o 0..23 (24 agujas)
-        int32_t y;
-        if (gfxPins == 24) {
-          y = cursorY + pinIndex;            // 1 punto por aguja a 180dpi: encaja exacto
-        } else {
-          y = cursorY + pinIndex * 3;        // 8 agujas a 1/60" = 3 puntos a 180dpi
-        }
-        plotDot(cursorX, y, currentColor);
-      }
+      if (!(byteVal & (0x80 >> bit))) continue;
+      int pinIndex = b * 8 + bit;              // 0..7 (8 agujas) o 0..23 (24 agujas)
+      int32_t y0 = cursorY + pinIndex * gfxDotH;
+      for (int32_t x = xa; x < xb; x++)
+        for (uint8_t dy = 0; dy < gfxDotH; dy++)
+          plotDot(x, y0 + dy, currentColor);
     }
   }
-  cursorX += gfxStepDots;
-  memset(gfxMergeAccum, 0, sizeof(gfxMergeAccum));
-  gfxMergeCount = 0;
-}
-
-void plotGraphicsColumn() {
-  // Se llama con 1 columna de origen ya recibida en gfxColBuf; se combina
-  // en el acumulador y solo se "pinta" y se avanza X cuando el grupo de
-  // fusion esta completo (grupo de 1 columna en los modos <=180dpi).
-  for (int b = 0; b < gfxBytesPerCol; b++) gfxMergeAccum[b] |= gfxColBuf[b];
-  gfxMergeCount++;
   gfxColIndex++;
   gfxColBufPos = 0;
-  if (gfxMergeCount >= gfxMergeFactor) {
-    plotMergedColumn();
-  }
+}
+
+// Fin del bloque: el cursor queda justo detras del ultimo punto, segun el dpi.
+void finishGraphicsBlock() {
+  cursorX = gfxX0 + ((int32_t)gfxNumCols * 180) / gfxDpi;
 }
 
 // Muchos programas y sistemas antiguos no mandan los parametros de tipo
@@ -1409,7 +1389,7 @@ void handleByteInner(uint8_t b) {
       if (gfxColBufPos >= gfxBytesPerCol) {
         plotGraphicsColumn();
         if (gfxColIndex >= gfxNumCols) {
-          if (gfxMergeCount > 0) plotMergedColumn(); // grupo de fusion incompleto al final del bloque
+          finishGraphicsBlock();
           escState = ST_NORMAL;
         }
       }
@@ -1429,7 +1409,7 @@ void handleByteInner(uint8_t b) {
       if (gfxColBufPos >= gfxBytesPerCol) {
         plotGraphicsColumn();
         if (gfxColIndex >= gfxNumCols) {
-          if (gfxMergeCount > 0) plotMergedColumn(); // grupo de fusion incompleto al final del bloque
+          finishGraphicsBlock();
           escState = ST_NORMAL;
         }
       }
