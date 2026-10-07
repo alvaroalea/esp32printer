@@ -46,6 +46,12 @@
  *     momento de fijarlos; despues cambiar el CPI NO los mueve) y salto de
  *     linea automatico (CR+LF) al llegar al margen derecho, como una
  *     impresora real, en vez de perder los caracteres sobrantes.
+ *     Justificacion (ESC a 0/1/2: izquierda/centro/derecha), tabuladores
+ *     (HT, ESC D, ESC e, ESC R) y posicionamiento horizontal (ESC $, ESC \,
+ *     ESC f). El texto NO se dibuja al llegar: pasa por un buffer de linea
+ *     (LINE_BUFFER_CHARS) que se dibuja al terminar la linea (LF, CR, FF,
+ *     salto automatico, grafico, boton...). Eso permite alinear, tener una
+ *     linea base comun real aunque se mezclen alturas, y borrar con CAN/DEL.
  *     Los caracteres definidos por el usuario, tabulaciones verticales,
  *     microavances (ESC J), formato de pagina, etc. no estan
  *     implementados; los bytes de parametro de secuencias no
@@ -157,6 +163,11 @@
 #define AUTO_LF_ON_CR  false  // CR (0x0D) tambien hace un salto de linea
 #define AUTO_CR_ON_LF  true   // LF (0x0A) tambien vuelve al margen izquierdo
 #define IDLE_TIMEOUT_MS   600000UL  // 10 minutos. millis() es un unsigned long de 32 bits
+#define LINE_BUFFER_CHARS 512       // caracteres que caben en el buffer de linea (>=256; 8 bytes cada uno = 4KB). Si se llena, se dibuja lo acumulado y se sigue.
+#define LINE_IDLE_FLUSH_MS 3000UL   // si el host se calla este tiempo con texto sin terminar (sin LF/CR/FF), se dibuja igualmente
+#define DEL_CLEARS_WHOLE_LINE false // DEL (0x7F): false = borra solo el ULTIMO caracter del buffer (ESC/P real); true = borra todo el buffer como CAN
+#define ESC_R_RESETS_TABS  true     // ESC R sin parametro = restaurar tabuladores de fabrica (modo IBM/Epson). false = ESC R n (juego internacional de caracteres, n se descarta)
+#define MAX_HTABS          32       // tabuladores horizontales maximos de ESC D
                                      // (desborda a los ~49.7 dias), asi que 10 minutos caben
                                      // de sobra sin ningun problema; no hace falta recortarlo.
 
@@ -191,6 +202,17 @@ struct RGB { uint8_t r, g, b; };
 // "'FontChoice' does not name a type".
 struct FontChoice { const uint8_t *data; uint8_t cols; uint8_t rows; uint8_t firstChar; uint8_t lastChar; uint8_t baseScaleY; };
 struct GfxMode { uint8_t pins; uint16_t dpi; }; // ver el comentario de FontChoice: debe ir aqui, antes de cualquier funcion
+// Un caracter pendiente de dibujar en el buffer de linea, con todos los atributos que tenia al llegar:
+struct LineChar {
+  int16_t x;        // posicion X logica (puntos) donde se imprimiria sin alinear
+  uint8_t ch;
+  uint8_t color;
+  uint8_t flags;    // bit0 negrita, bit1 subrayado, bit2 sobrerrayado, bit3 cursiva, bit4 NLQ, bit5 ancho doble, bit6 condensado
+  uint8_t typeface;
+  uint8_t pitch;
+  uint8_t hMul;     // heightMultiplier (ESC w)
+  uint8_t script;   // scriptMode
+};
 
 // Declaraciones adelantadas: el codigo de escritura en SD (mas abajo) necesita
 // avisar al LED en el momento exacto en que empieza/termina a escribir, pero
@@ -260,6 +282,21 @@ uint8_t scriptMode    = 0;   // ESC S n / ESC T : 0=normal 1=superindice 2=subin
 uint16_t lineCellHeight = 0;  // alto de la celda mas alta dibujada en esta linea (linea base comun)
 int32_t  lineMinAdvance = 0;  // avance minimo en el LF para no pisar la linea siguiente (solo con alto doble/cuadruple; 0 = usar interlineado)
 
+// Buffer de linea (ver flushLineBuffer()): el texto se acumula aqui y se dibuja al cerrar la linea.
+LineChar lineBuf[LINE_BUFFER_CHARS];
+uint16_t lineBufCount = 0;
+uint8_t  lineBufJust = 0;     // justificacion con la que se abrio el buffer (ESC a mid-linea vale desde la linea siguiente)
+uint8_t  justification = 0;   // ESC a n : 0=izquierda 1=centro 2=derecha
+
+// Tabuladores. Las posiciones se guardan en puntos RELATIVOS al margen izquierdo.
+int32_t  hTabStops[MAX_HTABS];
+uint8_t  hTabCount = 0;
+uint8_t  hTabMode = 0;        // 0 = de fabrica (cada 8 columnas del paso vigente), 1 = lista ESC D, 2 = incremento fijo ESC e 0 n
+int32_t  hTabFixedDots = 0;
+int32_t  vTabIncDots = 0;     // ESC e 1 n : VT salta al siguiente multiplo (desde arriba de la hoja); 0 = VT actua como LF
+uint8_t  escParam = 0;        // parametro intermedio de comandos ESC de varios bytes
+uint16_t escWord = 0;
+
 unsigned long lastByteMillis = 0;
 bool everReceivedByte = false;  // evita que el LED muestre "recibiendo" antes del primer byte real
 
@@ -308,6 +345,16 @@ enum EscState {
   ST_ESC_UNDERSCORE, // ESC _ n         (sobrerrayado on/off)
   ST_ESC_L_MARGIN, // ESC l n           (margen izquierdo, n columnas)
   ST_ESC_Q_MARGIN, // ESC Q n           (margen derecho, n columnas)
+  ST_ESC_A,        // ESC a n           (justificacion)
+  ST_ESC_D,        // ESC D n1..nk NUL  (tabuladores horizontales)
+  ST_ESC_E_M,      // ESC e m n         (incremento fijo de tabulador: m)
+  ST_ESC_E_N,      //                   (n)
+  ST_ESC_F_M,      // ESC f m n         (salto horizontal/vertical: m)
+  ST_ESC_F_N,      //                   (n)
+  ST_ESC_DOLLAR_L, // ESC $ nL nH       (posicion horizontal absoluta)
+  ST_ESC_DOLLAR_H,
+  ST_ESC_BSLASH_L, // ESC \ nL nH       (posicion horizontal relativa)
+  ST_ESC_BSLASH_H,
   ST_ESC_K,        // ESC k n           (tipo de letra)
   ST_ESC_X,        // ESC x n           (calidad borrador/NLQ)
   ST_ESC_W,        // ESC W n           (ancho doble on/off)
@@ -596,7 +643,10 @@ void closePage() {
   if (USE_XONXOFF) Serial2.write((uint8_t)0x11); // XON
 }
 
+void flushLineBuffer(); // declaracion adelantada (definida tras drawChar)
+
 void finishPageIfNeeded() {
+  flushLineBuffer(); // el texto pendiente de la linea se dibuja ANTES de cerrar la hoja
   if (pageOpen && pageHasInk) {
     closePage();
   } else if (pageOpen) {
@@ -681,6 +731,14 @@ FontChoice chooseFont() {
 }
 #endif
 
+// Factor de alto (ESC w) realmente aplicable: la linea mas alta debe caber en el
+// buffer de bandas (BAND_HEIGHT); si no cabe se reduce en vez de perder la parte superior.
+uint8_t effectiveHeightMul(FontChoice fc) {
+  uint8_t m = heightMultiplier;
+  while (m > 1 && (int)fc.rows * fc.baseScaleY * m > BAND_HEIGHT - 4) m--;
+  return m;
+}
+
 // Linea horizontal de subrayado / sobrerrayado a lo ancho de la celda del
 // caracter actual (cursorX .. cursorX+advance-1), de 'thick' filas desde yTop.
 // NLQ: continua. Borrador: a "golpes de aguja" del MISMO tamano que los puntos
@@ -709,8 +767,7 @@ void drawChar(uint8_t c) {
   // ESC w: doble/cuadruple alto (extension propia). La linea mas alta debe
   // caber en el buffer de bandas (BAND_HEIGHT): si no cabe, se reduce el factor
   // en vez de perder la parte superior del caracter.
-  uint8_t hMul = heightMultiplier;
-  while (hMul > 1 && (int)fc.rows * fc.baseScaleY * hMul > BAND_HEIGHT - 4) hMul--;
+  uint8_t hMul = effectiveHeightMul(fc);
 
   uint8_t scaleY = fc.baseScaleY * hMul;
   uint8_t normalScaleY = scaleY; // sin la reduccion de super/subindice (para el grosor de subrayado/sobrerrayado)
@@ -780,6 +837,93 @@ void drawChar(uint8_t c) {
   }
 }
 
+// ================================ BUFFER DE LINEA ===========================
+//
+// Los caracteres imprimibles no se dibujan al llegar: se guardan (con sus
+// atributos) en lineBuf[] y se dibujan todos juntos al cerrar la linea. Asi se
+// conoce la linea completa antes de pintar y se puede (1) alinear a derecha o
+// centro (ESC a), (2) fijar la linea base comun con el caracter MAS ALTO de la
+// linea, lo llegue antes o despues, (3) borrar lo pendiente con CAN/DEL.
+// Los graficos, tabuladores y saltos de posicion NO pasan por el buffer: solo
+// mueven cursorX (posicion logica) o fuerzan antes el volcado.
+
+void lineBufPush(uint8_t ch) {
+  if (lineBufCount >= LINE_BUFFER_CHARS) flushLineBuffer(); // lleno: se dibuja lo acumulado y se sigue
+  if (lineBufCount == 0) lineBufJust = justification;
+  LineChar &lc = lineBuf[lineBufCount++];
+  lc.x = (int16_t)cursorX;
+  lc.ch = ch;
+  lc.color = currentColor;
+  lc.flags = (boldMode ? 1 : 0) | (underlineMode ? 2 : 0) | (overscoreMode ? 4 : 0) | (italicMode ? 8 : 0) |
+             (lqMode ? 16 : 0) | (doubleWidthMode ? 32 : 0) | (condensedMode ? 64 : 0);
+  lc.typeface = typefaceMode;
+  lc.pitch = pitchMode;
+  lc.hMul = heightMultiplier;
+  lc.script = scriptMode;
+}
+
+// Carga en las variables de estado "vivas" los atributos del caracter i del
+// buffer, para reutilizar chooseFont()/computeAdvanceDots()/drawChar() tal cual.
+void applyLineChar(uint16_t i) {
+  const LineChar &lc = lineBuf[i];
+  currentColor = lc.color;
+  boldMode = lc.flags & 1;       underlineMode = lc.flags & 2;  overscoreMode = lc.flags & 4;
+  italicMode = lc.flags & 8;     lqMode = lc.flags & 16;        doubleWidthMode = lc.flags & 32;
+  condensedMode = lc.flags & 64;
+  typefaceMode = lc.typeface;    pitchMode = lc.pitch;
+  heightMultiplier = lc.hMul;    scriptMode = lc.script;
+}
+
+void flushLineBuffer() {
+  if (lineBufCount == 0) return;
+  uint16_t n = lineBufCount;
+  lineBufCount = 0; // se vacia ya: lo que sigue solo lee lineBuf[0..n-1]
+
+  // Estado vivo que hay que devolver intacto al terminar
+  int32_t sX = cursorX; uint8_t sColor = currentColor;
+  bool sBold = boldMode, sUl = underlineMode, sOs = overscoreMode, sIt = italicMode, sLq = lqMode, sDw = doubleWidthMode, sCond = condensedMode;
+  uint8_t sFace = typefaceMode, sPitch = pitchMode, sHMul = heightMultiplier, sScript = scriptMode;
+
+  // 1) Medir: celda mas alta de la linea y extension horizontal. Los espacios
+  //    del final no cuentan para centrar/alinear (no son parte visible del texto).
+  int16_t lastInk = -1;
+  for (uint16_t i = 0; i < n; i++) if (lineBuf[i].ch != ' ') lastInk = i;
+  uint16_t cell = lineCellHeight; // CR + sobreimpresion: la linea fisica ya impresa tambien cuenta
+  int32_t minX = 0x7FFFFFFF, maxX = -1;
+  for (uint16_t i = 0; i < n; i++) {
+    applyLineChar(i);
+    FontChoice fc = chooseFont();
+    uint16_t h = fc.rows * fc.baseScaleY * effectiveHeightMul(fc);
+    if (h > cell) cell = h;
+    if ((int16_t)i <= lastInk) {
+      int32_t l = lineBuf[i].x, r = l + computeAdvanceDots();
+      if (l < minX) minX = l;
+      if (r > maxX) maxX = r;
+    }
+  }
+
+  // 2) Desplazamiento horizontal segun la justificacion con la que se abrio la linea
+  int32_t offset = 0;
+  if (maxX >= 0 && (lineBufJust == 1 || lineBufJust == 2)) {
+    int32_t width = maxX - minX;
+    if (lineBufJust == 1) offset = (leftMarginDots + (rightMarginDots - leftMarginDots - width) / 2) - minX; // centrado entre margenes
+    else                  offset = rightMarginDots - maxX;                                                   // pegado al margen derecho
+    if (minX + offset < leftMarginDots) offset = leftMarginDots - minX; // no cabe: se queda en el margen izquierdo
+  }
+
+  // 3) Dibujar con la celda comun (linea base compartida, alineados por abajo)
+  lineCellHeight = cell;
+  for (uint16_t i = 0; i < n; i++) {
+    applyLineChar(i);
+    cursorX = lineBuf[i].x + offset;
+    drawChar(lineBuf[i].ch);
+  }
+
+  cursorX = sX; currentColor = sColor;
+  boldMode = sBold; underlineMode = sUl; overscoreMode = sOs; italicMode = sIt; lqMode = sLq; doubleWidthMode = sDw; condensedMode = sCond;
+  typefaceMode = sFace; pitchMode = sPitch; heightMultiplier = sHMul; scriptMode = sScript;
+}
+
 // ================================ MAQUINA DE ESTADOS: PROCESADO =============
 
 void resetPrinterState() {
@@ -802,6 +946,9 @@ void resetPrinterState() {
   doubleWidthMode = false;
   heightMultiplier = 1;
   scriptMode = 0;
+  lineBufCount = 0;
+  justification = 0;
+  hTabMode = 0; hTabCount = 0; hTabFixedDots = 0; vTabIncDots = 0;
 }
 
 void startGraphicsCapture(uint8_t pins, uint16_t dpi) {
@@ -886,6 +1033,32 @@ void doLineFeed() {
   lineMinAdvance = 0;
 }
 
+// LF: vuelca el texto pendiente de la linea, avanza y (AUTO_CR_ON_LF) vuelve al margen izquierdo.
+void lineFeedAction() {
+  flushLineBuffer();
+  doLineFeed();
+  if (AUTO_CR_ON_LF) cursorX = leftMarginDots;
+}
+
+// HT: siguiente tabulador a la derecha de cursorX. Si no hay ninguno antes del
+// margen derecho se ignora (como las impresoras reales). Posiciones relativas al margen izquierdo.
+void doHorizontalTab() {
+  int32_t rel = cursorX - leftMarginDots;
+  int32_t next = -1;
+  if (hTabMode == 0) {                       // de fabrica: cada 8 columnas del paso vigente
+    int32_t cell = computeAdvanceDots() * 8;
+    next = ((rel / cell) + 1) * cell;
+  } else if (hTabMode == 2) {                // ESC e 0 n: incremento fijo
+    next = ((rel / hTabFixedDots) + 1) * hTabFixedDots;
+  } else {                                   // ESC D: lista explicita
+    for (uint8_t i = 0; i < hTabCount; i++) if (hTabStops[i] > rel) { next = hTabStops[i]; break; }
+  }
+  if (next < 0) return;
+  int32_t nx = leftMarginDots + next;
+  if (nx >= rightMarginDots) return;
+  cursorX = nx;
+}
+
 void handleByteInner(uint8_t b) {
   lastByteMillis = millis();
   everReceivedByte = true;
@@ -899,12 +1072,31 @@ void handleByteInner(uint8_t b) {
       if (b == 0x1B) { escState = ST_ESC; return; }
       switch (b) {
         case 0x0A: // LF
-          doLineFeed();
-          if (AUTO_CR_ON_LF) cursorX = leftMarginDots;
+          lineFeedAction();
           return;
-        case 0x0D: // CR
+        case 0x0D: // CR: dibuja la linea pendiente y vuelve al margen izquierdo (sin avanzar papel: permite sobreimprimir)
+          flushLineBuffer();
           cursorX = leftMarginDots;
           if (AUTO_LF_ON_CR) doLineFeed();
+          return;
+        case 0x0B: // VT: tabulador vertical (ESC e 1 n); sin tabuladores definidos actua como LF
+          if (vTabIncDots > 0) {
+            flushLineBuffer();
+            cursorY = ((cursorY / vTabIncDots) + 1) * vTabIncDots;
+            lineCellHeight = 0; lineMinAdvance = 0;
+            if (AUTO_CR_ON_LF) cursorX = leftMarginDots;
+          } else {
+            lineFeedAction();
+          }
+          return;
+        case 0x18: // CAN: borra el buffer de linea (el texto pendiente no se imprime) y el cursor vuelve donde empezaba
+          if (lineBufCount > 0) { cursorX = lineBuf[0].x; lineBufCount = 0; }
+          return;
+        case 0x7F: // DEL: borra el ultimo caracter del buffer (o todo, segun DEL_CLEARS_WHOLE_LINE)
+          if (lineBufCount > 0) {
+            if (DEL_CLEARS_WHOLE_LINE) { cursorX = lineBuf[0].x; lineBufCount = 0; }
+            else { lineBufCount--; cursorX = lineBuf[lineBufCount].x; }
+          }
           return;
         case 0x0C: // FF
           finishPageIfNeeded();
@@ -913,11 +1105,9 @@ void handleByteInner(uint8_t b) {
           cursorX -= computeAdvanceDots();
           if (cursorX < leftMarginDots) cursorX = leftMarginDots;
           return;
-        case 0x09: { // HT: tabulador cada 8 celdas de caracter
-          int32_t cell = computeAdvanceDots() * 8;
-          cursorX = ((cursorX / cell) + 1) * cell;
+        case 0x09: // HT: tabulador horizontal (ver doHorizontalTab)
+          doHorizontalTab();
           return;
-        }
         case 0x0F: // SI: activa condensado (tambien existe como ESC SI)
           condensedMode = true;
           return;
@@ -935,6 +1125,7 @@ void handleByteInner(uint8_t b) {
             // Solo se envuelve una vez: si no cupiera ni vacia la linea, se dibuja
             // igualmente (recortado) en vez de entrar en bucle.
             if (cursorX + (int32_t)adv > rightMarginDots) {
+              flushLineBuffer(); // la linea que se cierra se dibuja (y alinea) antes de bajar
               cursorX = leftMarginDots;
               doLineFeed();
               if (cursorY >= PAGE_HEIGHT_DOTS) { // el salto acaba la hoja: pagina nueva sin perder el caracter
@@ -943,7 +1134,7 @@ void handleByteInner(uint8_t b) {
                 cursorX = leftMarginDots;
               }
             }
-            drawChar(b);
+            lineBufPush(b); // se dibuja al cerrar la linea (flushLineBuffer)
             cursorX += adv;
           }
           // bytes >= 0x80 (juegos de caracteres extendidos/acentos) no
@@ -953,7 +1144,7 @@ void handleByteInner(uint8_t b) {
 
     case ST_ESC:
       switch (b) {
-        case '@': resetPrinterState(); escState = ST_NORMAL; return;      // ESC @
+        case '@': flushLineBuffer(); resetPrinterState(); escState = ST_NORMAL; return;      // ESC @ (el texto pendiente se imprime antes)
         case '2': lineSpacingDots = DEFAULT_LINE_DOTS; escState = ST_NORMAL; return; // 1/6"
         case '0': lineSpacingDots = 23; escState = ST_NORMAL; return;     // 1/8" (aprox)
         case '3': escState = ST_ESC_3; return;                            // ESC 3 n
@@ -966,11 +1157,21 @@ void handleByteInner(uint8_t b) {
         case '_': escState = ST_ESC_UNDERSCORE; return;                  // sobrerrayado
         case 'l': escState = ST_ESC_L_MARGIN; return;                    // ESC l n: margen izquierdo
         case 'Q': escState = ST_ESC_Q_MARGIN; return;                    // ESC Q n: margen derecho
-        case '*': escState = ST_ESC_STAR_M; return;                      // grafico ESC *
-        case 'K': startGraphicsCapture(8, 60);  escState = ST_ESC_KLYZ_NL; return;
-        case 'L': startGraphicsCapture(8, 120); escState = ST_ESC_KLYZ_NL; return;
-        case 'Y': startGraphicsCapture(8, 120); escState = ST_ESC_KLYZ_NL; return;
-        case 'Z': startGraphicsCapture(8, 240); escState = ST_ESC_KLYZ_NL; return;
+        case 'a': escState = ST_ESC_A; return;                           // ESC a n: justificacion
+        case 'D': hTabCount = 0; hTabMode = 1; escState = ST_ESC_D; return; // ESC D n1..nk NUL: tabuladores (cancela los anteriores)
+        case 'e': escState = ST_ESC_E_M; return;                         // ESC e m n: incremento fijo de tabulador
+        case 'f': escState = ST_ESC_F_M; return;                         // ESC f m n: salto horizontal/vertical
+        case '$': escState = ST_ESC_DOLLAR_L; return;                    // ESC $ nL nH: posicion horizontal absoluta
+        case '\\': escState = ST_ESC_BSLASH_L; return;                    // ESC \ nL nH: posicion horizontal relativa
+        case 'R':                                                        // ESC R: tabuladores de fabrica (modo IBM) / juego internacional (modo Epson)
+          if (ESC_R_RESETS_TABS) { hTabMode = 0; hTabCount = 0; vTabIncDots = 0; escState = ST_NORMAL; }
+          else escState = ST_ESC_SKIP1; // ESC R n: n se descarta
+          return;
+        case '*': flushLineBuffer(); escState = ST_ESC_STAR_M; return;   // grafico ESC *
+        case 'K': flushLineBuffer(); startGraphicsCapture(8, 60);  escState = ST_ESC_KLYZ_NL; return;
+        case 'L': flushLineBuffer(); startGraphicsCapture(8, 120); escState = ST_ESC_KLYZ_NL; return;
+        case 'Y': flushLineBuffer(); startGraphicsCapture(8, 120); escState = ST_ESC_KLYZ_NL; return;
+        case 'Z': flushLineBuffer(); startGraphicsCapture(8, 240); escState = ST_ESC_KLYZ_NL; return;
         case 'k': escState = ST_ESC_K; return;                            // ESC k n: tipo de letra
         case 'x': escState = ST_ESC_X; return;                            // ESC x n: borrador/NLQ
         case 'P': pitchMode = 0; escState = ST_NORMAL; return;            // pica (10 cpi)
@@ -1030,6 +1231,69 @@ void handleByteInner(uint8_t b) {
       int32_t m = (int32_t)b * computeColumnDots();
       if (m > PAGE_WIDTH_DOTS) m = PAGE_WIDTH_DOTS; // mas alla de la hoja: lo maximo posible
       if (m > leftMarginDots) rightMarginDots = m;  // debe quedar a la derecha del margen izquierdo; si no, se ignora
+      escState = ST_NORMAL;
+      return;
+    }
+
+    case ST_ESC_A: { // justificacion: 0 izquierda, 1 centro, 2 derecha (3 = completa: no soportada, se usa izquierda)
+      uint8_t v = decodeNumericParam(b);
+      if (v <= 2) justification = v;
+      else { justification = 0; Serial.println("[DEBUG] ESC a 3 (justificacion completa) no soportada: se usa izquierda"); }
+      escState = ST_NORMAL;
+      return;
+    }
+
+    case ST_ESC_D: { // columnas (byte crudo) al paso vigente; termina con NUL, con un valor no creciente o al llegar a MAX_HTABS
+      int32_t pos = (int32_t)b * computeColumnDots();
+      if (b == 0 || hTabCount >= MAX_HTABS || (hTabCount > 0 && pos <= hTabStops[hTabCount - 1])) {
+        escState = ST_NORMAL;
+        if (b != 0) handleByteInner(b); // no era un tabulador: se procesa como dato normal
+        return;
+      }
+      hTabStops[hTabCount++] = pos;
+      return;
+    }
+
+    case ST_ESC_E_M: escParam = decodeNumericParam(b); escState = ST_ESC_E_N; return;
+    case ST_ESC_E_N:
+      if (escParam == 0 && b > 0) { hTabFixedDots = (int32_t)b * computeColumnDots(); hTabMode = 2; } // horizontal: cada n columnas del paso vigente
+      else if (escParam == 1)      { vTabIncDots = (int32_t)b * lineSpacingDots; }                      // vertical: cada n lineas (0 = VT es LF)
+      escState = ST_NORMAL;
+      return;
+
+    case ST_ESC_F_M: escParam = decodeNumericParam(b); escState = ST_ESC_F_N; return;
+    case ST_ESC_F_N:
+      if (escParam == 0) { // salto horizontal: n columnas del paso vigente, sin pasar del margen derecho
+        int32_t nx = cursorX + (int32_t)b * computeAdvanceDots();
+        cursorX = (nx > rightMarginDots) ? rightMarginDots : nx;
+      } else if (escParam == 1) { // salto vertical: n lineas
+        for (uint8_t i = 0; i < b; i++) {
+          lineFeedAction();
+          if (cursorY >= PAGE_HEIGHT_DOTS) { // el salto acaba la hoja: sigue en la hoja siguiente
+            Serial.println("[INFO] Fin de hoja alcanzado: cerrando pagina automaticamente.");
+            finishPageIfNeeded();
+            openNewPage();
+            cursorX = leftMarginDots;
+          }
+        }
+      }
+      escState = ST_NORMAL;
+      return;
+
+    case ST_ESC_DOLLAR_L: escWord = b; escState = ST_ESC_DOLLAR_H; return;
+    case ST_ESC_DOLLAR_H: { // absoluta: n/60" desde el margen izquierdo (3 puntos a 180dpi); se ignora si pasa del margen derecho
+      int32_t nx = leftMarginDots + (int32_t)(escWord | ((uint16_t)b << 8)) * 3;
+      if (nx <= rightMarginDots) cursorX = nx;
+      escState = ST_NORMAL;
+      return;
+    }
+
+    case ST_ESC_BSLASH_L: escWord = b; escState = ST_ESC_BSLASH_H; return;
+    case ST_ESC_BSLASH_H: { // relativa con signo: 1/180" en NLQ (1 punto), 1/120" en borrador (1,5 puntos); se ignora fuera de margenes
+      int32_t v = (int16_t)(escWord | ((uint16_t)b << 8));
+      int32_t d = lqMode ? v : (v * 3) / 2;
+      int32_t nx = cursorX + d;
+      if (nx >= leftMarginDots && nx <= rightMarginDots) cursorX = nx;
       escState = ST_NORMAL;
       return;
     }
@@ -1317,6 +1581,12 @@ void loop() {
       sdOk = true;
       updateStatusLed(); // reflejar la recuperacion de inmediato, sin esperar a la siguiente vuelta
     }
+  }
+
+  // Texto pendiente sin terminar (sin LF/CR/FF) y el host se ha callado: se dibuja
+  // igualmente para que se vea en la web y no se pierda si se corta la corriente.
+  if (lineBufCount > 0 && (millis() - lastByteMillis > LINE_IDLE_FLUSH_MS)) {
+    flushLineBuffer();
   }
 
   // Si llevamos un rato sin recibir nada y hay una pagina con contenido sin
