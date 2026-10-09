@@ -9,8 +9,9 @@
  * Epson LQ de 24 agujas con cinta de color (Black/Cyan/Magenta/Yellow).
  * Interpreta texto y graficos de puntos, los "pinta" en un lienzo virtual
  * y, cada vez que llega un salto de pagina (Form Feed) o pasan unos segundos
- * sin actividad, vuelca la pagina completa a un fichero BMP indexado de 4
- * bits (16 colores de paleta, formato BI_RGB sin comprimir) en la SD.
+ * sin actividad, vuelca la pagina completa a un fichero BMP indexado de 8
+ * bits (paleta de 256 colores, de los que hoy se usan 8; formato BI_RGB sin
+ * comprimir) en la SD.
  *
  * ---------------------------------------------------------------------
  * HARDWARE ESPERADO (ajustar en la seccion CONFIGURACION):
@@ -142,17 +143,17 @@
                                   // Form Feed, la pagina se cierra sola y se abre una nueva.
 
 // --- Cache en PSRAM para el servidor web (ver wifi_web.ino) ---
-// Con el formato indexado de 4 bits, una pagina completa (PAGE_WIDTH_DOTS x
-// PAGE_HEIGHT_DOTS) ocupa ~1.4MB -- cabe de sobra en los 8MB de PSRAM de un
-// ESP32-S3 N16R8 (antes, en 24 bits sin comprimir, eran ~8.4MB y NO cabia
+// Con el formato indexado de 8 bits (1 byte por pixel), una pagina completa
+// (PAGE_WIDTH_DOTS x PAGE_HEIGHT_DOTS) ocupa ~2.8MB -- cabe en los 8MB de PSRAM
+// de un ESP32-S3 N16R8 (con 24 bits sin comprimir eran ~8.4MB y NO cabia
 // una pagina entera; de ahi que esto sea un "presupuesto" y no el tamano
 // de la pagina). Mientras se imprime, cada fila que se vuelca a la SD se
 // copia tambien aqui (si hay hueco); el servidor web sirve directamente
 // desde esta cache lo que quepa en ella y solo recurre a leer de la SD
-// para el resto (en la practica, con 2MB de presupuesto, nunca hace falta
+// para el resto (en la practica, con 3MB de presupuesto, nunca hace falta
 // para una pagina de tamano normal). Si no hay PSRAM en la placa, esto se
 // desactiva solo y todo se sirve desde la SD como antes.
-#define WEB_BMP_CACHE_MAX_BYTES (2UL * 1024 * 1024) // 2MB: cubre una pagina entera de sobra
+#define WEB_BMP_CACHE_MAX_BYTES (3UL * 1024 * 1024) // 3MB: cubre una pagina entera (~2.8MB con 8 bits por pixel)
 #define BAND_HEIGHT       128    // Alto del buffer de bandas en filas. DEBE ser mayor que la linea mas alta
                                   // que pueda dibujarse (5x7 a x4 de alto = 84 filas, 8x8 = 96): con una
                                   // banda menor, los caracteres altos pierden su parte superior porque
@@ -249,15 +250,19 @@ static const RGB PALETTE[8] = {
   {0,   166, 81 },  // 6 Verde (cian+amarillo)
   {255, 255, 255},  // 7 Blanco (no usado como tinta, solo de referencia)
 };
-#define COLOR_WHITE_INDEX 255  // marcador interno de "sin tinta" en el buffer
+#define PALETTE_USED 8         // colores definidos hoy en PALETTE (negro, 3 primarios, 3 mezclas y blanco)
+#define COLOR_WHITE_INDEX 7    // "sin tinta" en el buffer = blanco del papel = entrada 7 de la paleta: el indice del
+                               // buffer (band[]) es directamente el indice de paleta que se guarda en el fichero
 
-// --- Formato de fichero: BMP INDEXADO de 4 bits (16 colores de paleta, de
-// los que se usan 8) en vez de BMP de 24 bits sin comprimir. Mismo aspecto
-// visual exacto (la paleta es la misma de siempre), pero cada pixel ocupa
-// medio byte en vez de tres: los ficheros quedan 6 veces mas pequenos, lo
-// que ademas acelera mucho servirlos por el servidor web.
-#define BMP_PALETTE_COLORS 16                              // minimo que admite el formato "4bpp" de BMP
-#define BMP_HEADER_BYTES (54 + BMP_PALETTE_COLORS * 4)      // cabecera + tabla de color (54 + 64 = 118)
+// --- Formato de fichero: BMP INDEXADO de 8 bits (1 byte por pixel) con una
+// paleta de 256 entradas, aunque hoy solo se usen PALETTE_USED=8 (negro,
+// magenta, cian, violeta, amarillo, rojo, verde y blanco): las entradas
+// PALETTE_USED..255 se rellenan con blanco (el papel) y quedan libres para
+// anadir colores en el futuro sin cambiar el formato. El indice de band[] se
+// escribe tal cual en el fichero (sin empaquetar). Cada pagina ocupa ~2.8MB.
+#define BMP_BITS_PER_PIXEL 8
+#define BMP_PALETTE_COLORS 256                              // entradas de la tabla de color (indices 0..255)
+#define BMP_HEADER_BYTES (54 + BMP_PALETTE_COLORS * 4)      // cabecera + tabla de color (54 + 1024 = 1078)
 
 // ================================ ESTADO GLOBAL ============================
 
@@ -438,10 +443,13 @@ bool pageFileCreated = false;                     // el fichero BMP de la pagina
 int32_t lastRowWritten = -2;                      // ultima fila escrita (para escribir en secuencia sin hacer seek)
 uint8_t bandDirty[BAND_HEIGHT];                   // por hueco del anillo: fila modificada y aun no escrita al fichero
 uint8_t rowWrittenBits[(PAGE_HEIGHT_DOTS + 7) / 8]; // por fila: ya se ha escrito alguna vez al fichero (si no, es blanca)
-static uint8_t whiteChunk[4096];                  // relleno blanco para crear el fichero (indice 7 en los dos nibbles)
+static uint8_t whiteChunk[8192];                  // relleno blanco para crear el fichero (indice COLOR_WHITE_INDEX en cada byte)
+static uint8_t rowIoBuf[PAGE_WIDTH_DOTS + 4];     // fila leida de la SD en loadRow() (estatico: no gasta pila)
+static uint8_t bmpHeaderBuf[BMP_HEADER_BYTES];    // cabecera BMP en materializePage() (estatico: no gasta pila)
+static_assert((PAGE_WIDTH_DOTS % 4) == 0, "con 8 bits por pixel la fila debe ser multiplo de 4 bytes (se escribe tal cual desde band[])");
 
 uint32_t rowSizeBytes() {
-  uint32_t raw = ((uint32_t)PAGE_WIDTH_DOTS + 1) / 2; // 4 bits/pixel = 2 pixeles por byte
+  uint32_t raw = ((uint32_t)PAGE_WIDTH_DOTS * BMP_BITS_PER_PIXEL + 7) / 8; // 8 bits/pixel = 1 byte por pixel
   return (raw + 3) & ~((uint32_t)3); // redondeo a multiplo de 4
 }
 
@@ -456,26 +464,17 @@ bool cacheCoversPage() {
 }
 
 // Escribe al fichero (y a la cache) la fila y si esta modificada. Debe llamarse con la SD bloqueada.
+// Con 8 bits por pixel la fila del fichero es identica a la de band[]: se escribe directamente.
 void writeBackRow(int32_t y) {
   if (y < 0 || y >= PAGE_HEIGHT_DOTS) return;
   int32_t rel = y % BAND_HEIGHT;
   if (!bandDirty[rel]) return;
-  uint32_t rs = rowSizeBytes();
-  uint8_t rowBuf[PAGE_WIDTH_DOTS / 2 + 4]; // +4: margen para el relleno a multiplo de 4
-  memset(rowBuf, 0, sizeof(rowBuf));
-  for (int x = 0; x < PAGE_WIDTH_DOTS; x++) {
-    uint8_t idx = band[rel][x];
-    if (idx == COLOR_WHITE_INDEX) idx = 7; // blanco = entrada 7 de la paleta
-    // 2 pixeles por byte: el primero (x par) va en el nibble alto, el
-    // segundo (x impar) en el nibble bajo -- orden estandar de BMP 4bpp.
-    if (x & 1) rowBuf[x / 2] |= (idx & 0x0F);
-    else       rowBuf[x / 2] |= (idx & 0x0F) << 4;
-  }
+  uint32_t rs = rowSizeBytes(); // == PAGE_WIDTH_DOTS (static_assert arriba)
   uint32_t off = BMP_HEADER_BYTES + (uint32_t)y * rs;
   if (lastRowWritten != y - 1) pageFile.seek(off); // escritura secuencial: el puntero ya esta en su sitio
-  pageFile.write(rowBuf, rs);                      // una unica escritura por fila
+  pageFile.write(band[rel], rs);                   // una unica escritura por fila
   lastRowWritten = y;
-  if (cacheCoversPage()) memcpy(bmpCacheBuffer + off, rowBuf, rs);
+  if (cacheCoversPage()) memcpy(bmpCacheBuffer + off, band[rel], rs);
   rowWrittenBits[y >> 3] |= (uint8_t)(1 << (y & 7));
   bandDirty[rel] = 0;
 }
@@ -491,19 +490,13 @@ void loadRow(int32_t y) {
   }
   uint32_t rs = rowSizeBytes();
   uint32_t off = BMP_HEADER_BYTES + (uint32_t)y * rs;
-  uint8_t rowBuf[PAGE_WIDTH_DOTS / 2 + 4];
-  const uint8_t *src;
   if (cacheCoversPage()) {
-    src = bmpCacheBuffer + off;          // sin tocar la SD
+    memcpy(band[rel], bmpCacheBuffer + off, PAGE_WIDTH_DOTS); // sin tocar la SD
   } else {
     pageFile.seek(off);
-    pageFile.read(rowBuf, rs);
+    pageFile.read(rowIoBuf, rs);
     lastRowWritten = -2;                 // el puntero ya no esta tras la ultima fila escrita
-    src = rowBuf;
-  }
-  for (int x = 0; x < PAGE_WIDTH_DOTS; x++) {
-    uint8_t nib = (x & 1) ? (src[x / 2] & 0x0F) : (src[x / 2] >> 4);
-    band[rel][x] = (nib == 7) ? COLOR_WHITE_INDEX : nib;
+    memcpy(band[rel], rowIoBuf, PAGE_WIDTH_DOTS);
   }
 }
 
@@ -565,12 +558,12 @@ bool materializePage() {
   writingToSD = true; // el LED solo refleja "escribiendo" a partir de aqui, no durante la busqueda de nombre
   updateStatusLed();
 
-  // --- Cabecera BMP indexada de 4 bits (BMP_HEADER_BYTES = 118 bytes: 54 de cabecera
-  // + 64 de tabla de color), DEFINITIVA desde el principio: alto de toda la hoja.
+  // --- Cabecera BMP indexada de 8 bits (BMP_HEADER_BYTES = 1078 bytes: 54 de cabecera
+  // + 1024 de tabla de color de 256 entradas), DEFINITIVA desde el principio: alto de toda la hoja.
   uint32_t total = pageFileTotalBytes();
   uint32_t hNeg = (uint32_t)(-(int32_t)PAGE_HEIGHT_DOTS); // alto negativo = filas de arriba a abajo
-  uint8_t header[BMP_HEADER_BYTES];
-  memset(header, 0, sizeof(header));
+  uint8_t *header = bmpHeaderBuf;
+  memset(header, 0, BMP_HEADER_BYTES);
   header[0] = 'B'; header[1] = 'M';
   header[2] = (uint8_t)(total & 0xFF); header[3] = (uint8_t)((total >> 8) & 0xFF);
   header[4] = (uint8_t)((total >> 16) & 0xFF); header[5] = (uint8_t)((total >> 24) & 0xFF);
@@ -584,26 +577,26 @@ bool materializePage() {
   header[22] = (uint8_t)(hNeg & 0xFF); header[23] = (uint8_t)((hNeg >> 8) & 0xFF);
   header[24] = (uint8_t)((hNeg >> 16) & 0xFF); header[25] = (uint8_t)((hNeg >> 24) & 0xFF);
   header[26] = 1; // planos
-  header[28] = 4; // bits por pixel: 4 (16 colores de paleta, indexado)
+  header[28] = BMP_BITS_PER_PIXEL; // bits por pixel: 8 (paleta de 256 colores, indexado)
   // bytes 30..33 (compresion BI_RGB) y 34..37 (tamano de imagen) ya son 0
   header[38] = 0x12; header[39] = 0x0B; // ~2834 pixeles/metro (180dpi), X
   header[42] = 0x12; header[43] = 0x0B; // idem, Y
   // bytes 46..49 (colores en la paleta) y 50..53 (colores importantes) a 0 = "el maximo
-  // del bit depth" (16), convencion estandar.
-  // Tabla de color (16 entradas x 4 bytes BGR0): las primeras 8 son la paleta real de la cinta.
-  for (int i = 0; i < 8; i++) {
+  // del bit depth" (256), convencion estandar.
+  // Tabla de color (256 entradas x 4 bytes BGR0): las PALETTE_USED primeras son la paleta real
+  // de la cinta; el resto (libres para el futuro) se rellena con blanco, el color del papel.
+  for (int i = 0; i < BMP_PALETTE_COLORS; i++) {
     uint8_t *entry = &header[54 + i * 4];
-    entry[0] = PALETTE[i].b;
-    entry[1] = PALETTE[i].g;
-    entry[2] = PALETTE[i].r;
+    if (i < PALETTE_USED) { entry[0] = PALETTE[i].b; entry[1] = PALETTE[i].g; entry[2] = PALETTE[i].r; }
+    else                  { entry[0] = 255;          entry[1] = 255;          entry[2] = 255; }
     entry[3] = 0;
   }
-  pageFile.write(header, sizeof(header));
+  pageFile.write(header, BMP_HEADER_BYTES);
 
-  // --- Hoja entera en blanco (indice 7 en los dos nibbles = 0x77). Escribir de verdad
+  // --- Hoja entera en blanco (indice COLOR_WHITE_INDEX en cada byte). Escribir de verdad
   // (y no solo hacer seek) es imprescindible: en FAT, extender un fichero con seek
   // deja datos basura sin inicializar.
-  memset(whiteChunk, 0x77, sizeof(whiteChunk));
+  memset(whiteChunk, COLOR_WHITE_INDEX, sizeof(whiteChunk));
   uint32_t remaining = total - BMP_HEADER_BYTES;
   while (remaining > 0) {
     uint32_t n = (remaining < sizeof(whiteChunk)) ? remaining : (uint32_t)sizeof(whiteChunk);
@@ -617,8 +610,8 @@ bool materializePage() {
   // se fija al final: el servidor web nunca ve una cache a medio inicializar.
   bmpCacheBytes = 0;
   if (bmpCacheBuffer && bmpCacheCapacity >= total) {
-    memcpy(bmpCacheBuffer, header, sizeof(header));
-    memset(bmpCacheBuffer + BMP_HEADER_BYTES, 0x77, total - BMP_HEADER_BYTES);
+    memcpy(bmpCacheBuffer, header, BMP_HEADER_BYTES);
+    memset(bmpCacheBuffer + BMP_HEADER_BYTES, COLOR_WHITE_INDEX, total - BMP_HEADER_BYTES);
     bmpCacheBytes = total;
   }
 
