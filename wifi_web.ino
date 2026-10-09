@@ -37,7 +37,8 @@
  *                      definitiva y fondo blanco), asi que es siempre un BMP
  *                      valido aunque la pagina no se haya terminado de
  *                      imprimir todavia (ver materializePage())
- *       /list          lista de todos los PAGEnnnn.BMP que hay en la SD
+ *       /list          lista de todos los PAGEnnnn.BMP que hay en la SD, cada
+ *                      uno con un boton para borrarlo (POST /delete)
  *       /wifi-reset    borra la red WiFi guardada y reinicia (para volver
  *                      a configurar otra red)
  *
@@ -242,9 +243,19 @@ void handleCurrentBmp() {
 }
 
 // --- /list: listado de paginas guardadas en la SD ---
+// Nombre de hoja generada por la impresora: exactamente "PAGE" + 4 digitos + ".BMP", sin
+// barras ni rutas. Es lo unico que /delete acepta borrar (evita rutas arbitrarias).
+bool isPageFileName(const String &n) {
+  if (n.length() != 12 || !n.startsWith("PAGE") || !n.endsWith(".BMP")) return false;
+  for (int i = 4; i < 8; i++) if (n[i] < '0' || n[i] > '9') return false;
+  return true;
+}
+
+// --- /list: listado de paginas guardadas en la SD, cada una con su boton de borrar ---
 void handleList() {
   String html = "<!DOCTYPE html><html><head><meta charset='utf-8'><title>Paginas</title>"
-                 "<style>body{font-family:sans-serif}</style></head><body>"
+                 "<style>body{font-family:sans-serif}"
+                 ".del{font-size:.7em;padding:0 .4em;margin-left:.4em;color:#b00;cursor:pointer}</style></head><body>"
                  "<h2>Paginas en la SD</h2><ul>";
   sdAccessBegin(); // listado breve: un unico bloqueo para toda la funcion
   File root = SD.open("/");
@@ -257,8 +268,20 @@ void handleList() {
         // segun la version del core; se normaliza para que el enlace sea
         // siempre una ruta absoluta valida ("/PAGE0001.BMP").
         String href = name.startsWith("/") ? name : ("/" + name);
+        String bare = name.startsWith("/") ? name.substring(1) : name;
         html += "<li><a href='" + href + "'>" + name + "</a> (" +
-                String(entry.size()) + " bytes)</li>";
+                String(entry.size()) + " bytes)";
+        if (pageOpen && pageFileCreated && href == String(currentFileName)) {
+          html += " <small>(imprimiendose ahora)</small>"; // la hoja en curso no se puede borrar
+        } else if (isPageFileName(bare)) {
+          // POST (no un enlace GET: un enlace podria borrarse al precargarlo el navegador o al
+          // seguirlo un rastreador) + confirmacion en el navegador antes de enviar.
+          html += " <form method='POST' action='/delete' style='display:inline' "
+                  "onsubmit=\"return confirm('Borrar " + bare + " de la SD?')\">"
+                  "<input type='hidden' name='f' value='" + bare + "'>"
+                  "<button type='submit' class='del' title='Borrar de la SD'>Borrar</button></form>";
+        }
+        html += "</li>";
       }
       entry = root.openNextFile();
     }
@@ -267,6 +290,34 @@ void handleList() {
   sdAccessEnd();
   html += "</ul><p><a href='/'>Volver</a></p></body></html>";
   webServer.send(200, "text/html", html);
+}
+
+// --- /delete (solo POST): borra de la SD una hoja PAGEnnnn.BMP y vuelve al listado ---
+void handleDelete() {
+  String f = webServer.arg("f");
+  if (!isPageFileName(f)) {
+    webServer.send(400, "text/plain", "Nombre de fichero no valido.");
+    return;
+  }
+  String path = "/" + f;
+  int result = 0; // 0 = borrada, 1 = no existe, 2 = se esta imprimiendo, 3 = fallo al borrar
+  sdAccessBegin(); // la comprobacion de "hoja en curso" va DENTRO del bloqueo: asi no puede cambiar mientras se borra
+  if (pageOpen && pageFileCreated && path == String(currentFileName)) result = 2;
+  else if (!SD.exists(path.c_str())) result = 1;
+  else if (!SD.remove(path.c_str())) result = 3;
+  sdAccessEnd();
+  if (result == 2) {
+    webServer.send(409, "text/plain", "Esa pagina se esta imprimiendo ahora mismo: no se puede borrar hasta que se cierre.");
+    return;
+  }
+  if (result == 3) {
+    webServer.send(500, "text/plain", "No se pudo borrar " + f + " de la SD.");
+    return;
+  }
+  if (result == 0) Serial.printf("[INFO] Pagina borrada desde la web: %s\n", path.c_str());
+  // 303 + Location: el navegador recarga /list con un GET, asi que F5 no repite el borrado.
+  webServer.sendHeader("Location", "/list");
+  webServer.send(303, "text/plain", "");
 }
 
 // --- Sirve cualquier .BMP que exista en la SD por su nombre de fichero
@@ -356,6 +407,7 @@ void setupWifiOtaWeb() {
   webServer.on("/", handleRoot);
   webServer.on("/current.bmp", handleCurrentBmp);
   webServer.on("/list", handleList);
+  webServer.on("/delete", HTTP_POST, handleDelete); // solo POST: un GET a /delete cae en onNotFound (404), nunca borra
   webServer.on("/wifi-reset", handleWifiReset);
   webServer.onNotFound(handlePossibleBmpFile); // sirve /PAGEnnnn.BMP (enlaces de /list)
   webServer.begin();
