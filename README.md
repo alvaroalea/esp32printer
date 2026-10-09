@@ -1,7 +1,7 @@
 # ESP32 Printer Emulator
 for computers with serial RS232 port.
 
-This is a vibecodding IA assited project.
+This is a vibecodding IA (claude) assited project.
 
 This project is based on the hardware of fujinet-rs232
 check the #defines at esp32printer.ino for the pinouts.
@@ -31,6 +31,13 @@ the RGB led of the board indicate the state of the printer:
 * YELLOW - FF Button has been pressed and page is being "explused"
 
 ## Actual Status
-This is a example of supported features:
+These are examples of supported features:
 
-![My image](sample.png) 
+Star LC 10 Colour basic demo from manual:
+![My image](sample.png)
+
+Colour dump of QL's game loading screen, with sdump from miracle: 
+![My image](sample2.png)
+
+Conected to a PC using Debian 13:
+![My image](sample3.png)
