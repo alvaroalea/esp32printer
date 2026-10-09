@@ -31,12 +31,12 @@
  *                      sola cada 2 segundos
  *       /current.bmp   la pagina que se esta imprimiendo AHORA MISMO (o la
  *                      ultima cerrada si no hay ninguna abierta), servida
- *                      directamente desde la SD mientras se sigue
- *                      escribiendo -- la cabecera del BMP se mantiene
- *                      coherente en todo momento gracias a
- *                      patchHeaderNow() (ver impresora_epson_esp32.ino),
- *                      asi que esto funciona aunque la pagina no se haya
- *                      terminado de imprimir todavia
+ *                      desde la cache PSRAM (o la SD si no hay) mientras se
+ *                      sigue escribiendo -- el fichero se crea desde el
+ *                      principio con el tamano completo de la hoja (cabecera
+ *                      definitiva y fondo blanco), asi que es siempre un BMP
+ *                      valido aunque la pagina no se haya terminado de
+ *                      imprimir todavia (ver materializePage())
  *       /list          lista de todos los PAGEnnnn.BMP que hay en la SD
  *       /wifi-reset    borra la red WiFi guardada y reinicia (para volver
  *                      a configurar otra red)
@@ -102,7 +102,7 @@ void handleRoot() {
                 "img{max-width:95%;border:1px solid #555;margin-top:10px;background:#fff}"
                 "a{color:#8cf}</style></head><body>"
                 "<h2>Emulador Impresora ESC/P (ESP32)</h2>";
-  if (pageOpen) {
+  if (pageOpen && pageFileCreated) {
     html += "<p>Imprimiendo ahora: " + String(currentFileName) + "</p>";
   } else if (pageIndex > 0) {
     html += "<p>Sin pagina abierta ahora mismo (se muestra la ultima generada).</p>";
@@ -178,7 +178,7 @@ void streamBmpFile(const char *path) {
 // (solo para la "cola" que no quepa en la cache, si la pagina ha crecido
 // mas alla del presupuesto de WEB_BMP_CACHE_MAX_BYTES) ---
 void streamCurrentBmpCached() {
-  uint32_t totalSize = BMP_HEADER_BYTES + rowSizeBytes() * rowsWrittenToFile;
+  uint32_t totalSize = pageFileTotalBytes(); // el fichero de la pagina en curso siempre tiene el tamano completo de la hoja
 
   if (!bmpCacheBuffer || bmpCacheBytes == 0) {
     // Sin cache utilizable todavia (placa sin PSRAM, o pagina recien abierta):
@@ -228,7 +228,7 @@ void streamCurrentBmpCached() {
 
 // --- /current.bmp: la pagina en curso, o la ultima cerrada si no hay ninguna abierta ---
 void handleCurrentBmp() {
-  if (pageOpen) {
+  if (pageOpen && pageFileCreated) { // (una pagina abierta pero aun sin tinta no tiene fichero: se sirve la ultima cerrada)
     streamCurrentBmpCached();
     return;
   }

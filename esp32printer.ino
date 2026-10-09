@@ -232,7 +232,6 @@ void sdWriteEnd();
 void sdAccessBegin();
 void sdAccessEnd();
 void updateStatusLed();
-void patchHeaderNow();
 
 // Definidas en wifi_web.ino (otra pestana del MISMO sketch, debe estar en
 // la misma carpeta): WiFi con portal de configuracion, OTA y servidor web.
@@ -266,7 +265,6 @@ File pageFile;
 bool pageOpen = false;          // hay un fichero de pagina abierto
 bool pageHasInk = false;        // se ha pintado algo desde que se abrio
 uint32_t pageIndex = 0;         // numero de pagina para el nombre de fichero
-uint32_t rowsWrittenToFile = 0; // filas ya volcadas a la SD para la pagina actual
 
 int32_t cursorX = 0;            // posicion horizontal actual, en puntos (0..PAGE_WIDTH_DOTS-1)
 int32_t cursorY = 0;            // posicion vertical actual dentro de la pagina, en puntos
@@ -418,96 +416,123 @@ GfxMode lookupStarMode(uint8_t m) {
 }
 
 // ================================ UTILIDADES DE BUFFER =====================
-
-void flushOneRow(); // declaracion adelantada (definida junto al resto de manejo del fichero BMP)
-
-void ensureBandCovers(int32_t y) {
-  // Si la fila y ya no cabe en la ventana actual del buffer, volcamos a la SD
-  // las filas mas antiguas hasta que quepa.
-  if (y < bandBase + BAND_HEIGHT) return; // caso normal: no hace falta escribir nada
-  sdWriteBegin();
-  while (y >= bandBase + BAND_HEIGHT) {
-    flushOneRow();
-  }
-  patchHeaderNow(); // la cabecera refleja ya las filas recien volcadas
-  sdWriteEnd();
-}
+//
+// MODELO DE PAGINA (acceso aleatorio en vertical)
+//  - El fichero BMP de la pagina se crea ENTERO desde el primer momento, con el
+//    tamano final de la hoja (PAGE_HEIGHT_DOTS filas) y todo blanco: es un BMP
+//    valido en todo instante (cabecera definitiva), aunque se abra a medio imprimir.
+//  - band[] es una VENTANA de BAND_HEIGHT filas sobre ese bitmap (buffer en anillo,
+//    fila y -> hueco y % BAND_HEIGHT). La ventana puede deslizarse hacia abajo Y hacia
+//    arriba (moveWindowTo): las filas que salen se escriben en el fichero si han sido
+//    modificadas (bandDirty) y las que entran se LEEN de lo ya escrito (no se crean
+//    en blanco), asi se puede volver a pintar en trozos verticales ya impresos sin
+//    perder nada. Una fila que nunca se ha escrito se sabe en blanco sin leerla
+//    (rowWrittenBits). Si hay cache PSRAM (copia completa de la hoja) las lecturas
+//    salen de ella y no de la SD.
+//  - El fichero se crea al PRIMER punto con tinta (materializePage), no al abrir la
+//    pagina: una hoja que acaba en blanco no cuesta nada ni deja fichero.
 
 int32_t maxYUsed = -1; // fila mas baja en la que se ha pintado algo desde que se abrio la pagina
-
-void plotDot(int32_t x, int32_t y, uint8_t colorIndex) {
-  if (x < 0 || x >= PAGE_WIDTH_DOTS || y < 0 || y >= PAGE_HEIGHT_DOTS) return;
-  ensureBandCovers(y);
-  if (y < bandBase) return; // fila ya volcada a la SD (no deberia ocurrir con avance monotono)
-  int32_t rel = y % BAND_HEIGHT; // buffer en anillo: mismo indexado que usa flushOneRow()
-  band[rel][x] = colorIndex;
-  pageHasInk = true;
-  if (y > maxYUsed) maxYUsed = y;
-}
-
-// ================================ FICHERO BMP ===============================
-
 char currentFileName[32];
-
-void writeLE16(File &f, uint16_t v) { f.write((uint8_t)(v & 0xFF)); f.write((uint8_t)(v >> 8)); }
-void writeLE32(File &f, uint32_t v) {
-  f.write((uint8_t)(v & 0xFF));
-  f.write((uint8_t)((v >> 8) & 0xFF));
-  f.write((uint8_t)((v >> 16) & 0xFF));
-  f.write((uint8_t)((v >> 24) & 0xFF));
-}
+bool pageFileCreated = false;                     // el fichero BMP de la pagina actual ya existe en la SD
+int32_t lastRowWritten = -2;                      // ultima fila escrita (para escribir en secuencia sin hacer seek)
+uint8_t bandDirty[BAND_HEIGHT];                   // por hueco del anillo: fila modificada y aun no escrita al fichero
+uint8_t rowWrittenBits[(PAGE_HEIGHT_DOTS + 7) / 8]; // por fila: ya se ha escrito alguna vez al fichero (si no, es blanca)
+static uint8_t whiteChunk[4096];                  // relleno blanco para crear el fichero (indice 7 en los dos nibbles)
 
 uint32_t rowSizeBytes() {
   uint32_t raw = ((uint32_t)PAGE_WIDTH_DOTS + 1) / 2; // 4 bits/pixel = 2 pixeles por byte
   return (raw + 3) & ~((uint32_t)3); // redondeo a multiplo de 4
 }
 
-// Deja la cabecera BMP (alto y tamano de fichero, en los offsets 22 y 2)
-// coherente con lo que hay REALMENTE escrito en la SD en este momento
-// (rowsWrittenToFile filas completas), no con lo que se espera llegar a
-// escribir. Se llama tanto tras cada tanda de filas volcadas durante la
-// impresion como al cerrar la pagina, de forma que si alguien abre el
-// fichero a medio generar, encuentra siempre un BMP valido y autoconsistente
-// (ancho x filas-escritas-hasta-ahora), nunca una cabecera a 0 ni una que
-// prometa mas filas de las que hay fisicamente en el fichero.
-// Copia 'len' bytes al final de la cache PSRAM (si hay hueco) empezando en
-// la posicion bmpCacheBytes, y avanza bmpCacheBytes. Si no hay cache o ya no
-// queda sitio, no hace nada (la pagina sigue funcionando igual, sin cache
-// para esa parte: el servidor web recurrira a la SD para lo que falte).
-void cacheAppend(const uint8_t *data, uint32_t len) {
-  if (!bmpCacheBuffer) return;
-  if (bmpCacheBytes + len > bmpCacheCapacity) return;
-  memcpy(bmpCacheBuffer + bmpCacheBytes, data, len);
-  bmpCacheBytes += len;
+// Tamano del fichero BMP de una pagina (siempre el mismo: cabecera + hoja completa).
+uint32_t pageFileTotalBytes() {
+  return BMP_HEADER_BYTES + rowSizeBytes() * (uint32_t)PAGE_HEIGHT_DOTS;
 }
 
-// Reescribe 4 bytes ya presentes en la cache (para mantener los campos de
-// alto/tamano de la cabecera cacheada en sincronia con patchHeaderNow()).
-void cachePatchU32(uint32_t offset, uint32_t value) {
-  if (!bmpCacheBuffer) return;
-  if (offset + 4 > bmpCacheBytes) return; // esos bytes aun no estan cacheados
-  bmpCacheBuffer[offset + 0] = (uint8_t)(value & 0xFF);
-  bmpCacheBuffer[offset + 1] = (uint8_t)((value >> 8) & 0xFF);
-  bmpCacheBuffer[offset + 2] = (uint8_t)((value >> 16) & 0xFF);
-  bmpCacheBuffer[offset + 3] = (uint8_t)((value >> 24) & 0xFF);
+// La cache PSRAM contiene la hoja completa (cabecera + todas las filas) y esta al dia.
+bool cacheCoversPage() {
+  return bmpCacheBuffer && bmpCacheBytes == pageFileTotalBytes();
 }
 
-void patchHeaderNow() {
+// Escribe al fichero (y a la cache) la fila y si esta modificada. Debe llamarse con la SD bloqueada.
+void writeBackRow(int32_t y) {
+  if (y < 0 || y >= PAGE_HEIGHT_DOTS) return;
+  int32_t rel = y % BAND_HEIGHT;
+  if (!bandDirty[rel]) return;
   uint32_t rs = rowSizeBytes();
-  uint32_t endPos = BMP_HEADER_BYTES + rs * rowsWrittenToFile; // fin real de los datos escritos hasta ahora
-  pageFile.seek(2);
-  writeLE32(pageFile, endPos); // tamano de fichero = lo que hay escrito de verdad
-  pageFile.seek(22);
-  writeLE32(pageFile, (uint32_t)(-(int32_t)rowsWrittenToFile)); // alto negativo (top-down) = filas escritas hasta ahora
-  pageFile.flush(); // que quede fisicamente en la SD antes de que alguien mas lo lea
-  pageFile.seek(endPos); // IMPRESCINDIBLE: volver al final real para poder seguir anexando filas
-
-  cachePatchU32(2, endPos);
-  cachePatchU32(22, (uint32_t)(-(int32_t)rowsWrittenToFile));
+  uint8_t rowBuf[PAGE_WIDTH_DOTS / 2 + 4]; // +4: margen para el relleno a multiplo de 4
+  memset(rowBuf, 0, sizeof(rowBuf));
+  for (int x = 0; x < PAGE_WIDTH_DOTS; x++) {
+    uint8_t idx = band[rel][x];
+    if (idx == COLOR_WHITE_INDEX) idx = 7; // blanco = entrada 7 de la paleta
+    // 2 pixeles por byte: el primero (x par) va en el nibble alto, el
+    // segundo (x impar) en el nibble bajo -- orden estandar de BMP 4bpp.
+    if (x & 1) rowBuf[x / 2] |= (idx & 0x0F);
+    else       rowBuf[x / 2] |= (idx & 0x0F) << 4;
+  }
+  uint32_t off = BMP_HEADER_BYTES + (uint32_t)y * rs;
+  if (lastRowWritten != y - 1) pageFile.seek(off); // escritura secuencial: el puntero ya esta en su sitio
+  pageFile.write(rowBuf, rs);                      // una unica escritura por fila
+  lastRowWritten = y;
+  if (cacheCoversPage()) memcpy(bmpCacheBuffer + off, rowBuf, rs);
+  rowWrittenBits[y >> 3] |= (uint8_t)(1 << (y & 7));
+  bandDirty[rel] = 0;
 }
 
-void openNewPage() {
-  sdAccessBegin(); // bloquea la SD para toda la funcion (busqueda de nombre + apertura + cabecera)
+// Carga en la ventana la fila y: lo que haya ya escrito en el fichero (o la cache),
+// o blanco si esa fila nunca se ha escrito. Debe llamarse con la SD bloqueada.
+void loadRow(int32_t y) {
+  int32_t rel = y % BAND_HEIGHT;
+  bandDirty[rel] = 0;
+  if (y < 0 || y >= PAGE_HEIGHT_DOTS || !(rowWrittenBits[y >> 3] & (1 << (y & 7)))) {
+    memset(band[rel], COLOR_WHITE_INDEX, PAGE_WIDTH_DOTS);
+    return;
+  }
+  uint32_t rs = rowSizeBytes();
+  uint32_t off = BMP_HEADER_BYTES + (uint32_t)y * rs;
+  uint8_t rowBuf[PAGE_WIDTH_DOTS / 2 + 4];
+  const uint8_t *src;
+  if (cacheCoversPage()) {
+    src = bmpCacheBuffer + off;          // sin tocar la SD
+  } else {
+    pageFile.seek(off);
+    pageFile.read(rowBuf, rs);
+    lastRowWritten = -2;                 // el puntero ya no esta tras la ultima fila escrita
+    src = rowBuf;
+  }
+  for (int x = 0; x < PAGE_WIDTH_DOTS; x++) {
+    uint8_t nib = (x & 1) ? (src[x / 2] & 0x0F) : (src[x / 2] >> 4);
+    band[rel][x] = (nib == 7) ? COLOR_WHITE_INDEX : nib;
+  }
+}
+
+// Desliza la ventana para que empiece en newBase: escribe las filas que salen (si estan
+// modificadas) y carga las que entran. Las que se quedan no se tocan. Con la SD bloqueada.
+void moveWindowTo(int32_t newBase) {
+  if (newBase < 0) newBase = 0;
+  if (newBase == bandBase) return;
+  int32_t oldBase = bandBase, oldEnd = bandBase + BAND_HEIGHT, newEnd = newBase + BAND_HEIGHT;
+  for (int32_t y = oldBase; y < oldEnd; y++)          // 1) las que salen, antes de reutilizar su hueco
+    if (y < newBase || y >= newEnd) writeBackRow(y);
+  for (int32_t y = newBase; y < newEnd; y++)          // 2) las que entran
+    if (y < oldBase || y >= oldEnd) loadRow(y);
+  bandBase = newBase;
+}
+
+void ensureBandCovers(int32_t y) {
+  if (y >= bandBase && y < bandBase + BAND_HEIGHT) return; // caso normal: ya esta en la ventana
+  sdWriteBegin();
+  // Hacia abajo: se desliza lo minimo (y queda en la ultima fila). Hacia arriba: y pasa a ser
+  // la PRIMERA fila de la ventana, que es lo que conviene al dibujar de arriba abajo.
+  moveWindowTo((y >= bandBase + BAND_HEIGHT) ? (y - BAND_HEIGHT + 1) : y);
+  sdWriteEnd();
+}
+
+// Crea el fichero de la pagina actual con su tamano definitivo (cabecera final + hoja blanca).
+// Se llama al primer punto con tinta. Devuelve false si no se pudo (SD fallida o sin nombre libre).
+bool materializePage() {
+  sdAccessBegin(); // bloquea la SD para toda la funcion (busqueda de nombre + creacion + relleno)
 
   // pageIndex es un contador en RAM que arranca de 0 en cada reinicio del
   // ESP32, pero los ficheros de sesiones anteriores siguen en la SD. Para no
@@ -520,38 +545,35 @@ void openNewPage() {
   if (SD.exists(currentFileName)) {
     // No deberia ocurrir salvo que la SD ya tenga las 9999 paginas usadas.
     Serial.println("[ERROR] No se encontro un nombre de pagina libre (PAGE0001..PAGE9999.BMP agotados).");
+    currentFileName[0] = 0;
     pageOpen = false;
     sdAccessEnd();
-    return;
+    return false;
   }
-  pageFile = SD.open(currentFileName, FILE_WRITE);
+  pageFile = SD.open(currentFileName, "w+"); // lectura Y escritura: se vuelven a leer filas ya escritas
   if (!pageFile) {
     Serial.printf("[ERROR] No se pudo crear %s en la SD\n", currentFileName);
+    pageIndex--;
+    currentFileName[0] = 0;
     pageOpen = false;
     sdOk = false;
     sdAccessEnd();
     updateStatusLed(); // reflejar el fallo de inmediato, sin esperar al loop()
-    return;
+    return false;
   }
 
-  // Resto de la funcion: ya dentro de la zona de escritura (indicador LED
-  // incluido). writingToSD ya estaba implicitamente "en curso" desde el
-  // sdAccessBegin() de arriba, pero el LED solo refleja "escribiendo" a
-  // partir de aqui para no mostrar celeste durante la mera busqueda de
-  // nombre, que es casi instantanea.
-  writingToSD = true;
+  writingToSD = true; // el LED solo refleja "escribiendo" a partir de aqui, no durante la busqueda de nombre
   updateStatusLed();
 
-  // --- Cabecera BMP indexada de 4 bits (BMP_HEADER_BYTES = 118 bytes:
-  // 54 de cabecera + 64 de tabla de color), construida en RAM y escrita de
-  // una sola vez (una sola transaccion SPI en vez de muchas escrituras
-  // sueltas). Alto y tamano se dejan primero a 0 y los corrige
-  // patchHeaderNow() justo debajo, que en este punto (0 filas escritas) los
-  // deja en su valor coherente real: tamano=BMP_HEADER_BYTES, alto=0.
+  // --- Cabecera BMP indexada de 4 bits (BMP_HEADER_BYTES = 118 bytes: 54 de cabecera
+  // + 64 de tabla de color), DEFINITIVA desde el principio: alto de toda la hoja.
+  uint32_t total = pageFileTotalBytes();
+  uint32_t hNeg = (uint32_t)(-(int32_t)PAGE_HEIGHT_DOTS); // alto negativo = filas de arriba a abajo
   uint8_t header[BMP_HEADER_BYTES];
   memset(header, 0, sizeof(header));
   header[0] = 'B'; header[1] = 'M';
-  // bytes 2..5 (tamano) y 10..13 (offset a los pixeles) se fijan abajo
+  header[2] = (uint8_t)(total & 0xFF); header[3] = (uint8_t)((total >> 8) & 0xFF);
+  header[4] = (uint8_t)((total >> 16) & 0xFF); header[5] = (uint8_t)((total >> 24) & 0xFF);
   header[10] = (uint8_t)(BMP_HEADER_BYTES & 0xFF); // offset a los datos de pixel
   header[11] = (uint8_t)((BMP_HEADER_BYTES >> 8) & 0xFF);
   header[14] = 40; // tamano de BITMAPINFOHEADER
@@ -559,19 +581,16 @@ void openNewPage() {
   header[19] = (uint8_t)((PAGE_WIDTH_DOTS >> 8) & 0xFF);
   header[20] = (uint8_t)((PAGE_WIDTH_DOTS >> 16) & 0xFF);
   header[21] = (uint8_t)((PAGE_WIDTH_DOTS >> 24) & 0xFF);
-  // bytes 22..25 (alto) se fijan abajo
+  header[22] = (uint8_t)(hNeg & 0xFF); header[23] = (uint8_t)((hNeg >> 8) & 0xFF);
+  header[24] = (uint8_t)((hNeg >> 16) & 0xFF); header[25] = (uint8_t)((hNeg >> 24) & 0xFF);
   header[26] = 1; // planos
   header[28] = 4; // bits por pixel: 4 (16 colores de paleta, indexado)
   // bytes 30..33 (compresion BI_RGB) y 34..37 (tamano de imagen) ya son 0
   header[38] = 0x12; header[39] = 0x0B; // ~2834 pixeles/metro (180dpi), X
   header[42] = 0x12; header[43] = 0x0B; // idem, Y
-  // bytes 46..49 (colores en la paleta) y 50..53 (colores importantes) se
-  // dejan a 0, que para un bitmap indexado significa "el maximo del bit
-  // depth" (16), convencion estandar.
-
-  // Tabla de color (16 entradas x 4 bytes BGR0), justo despues de los 54
-  // bytes de cabecera. Las primeras 8 son la paleta real de la cinta; las
-  // 8 restantes no se usan (se dejan a 0, ya estan a 0 por el memset).
+  // bytes 46..49 (colores en la paleta) y 50..53 (colores importantes) a 0 = "el maximo
+  // del bit depth" (16), convencion estandar.
+  // Tabla de color (16 entradas x 4 bytes BGR0): las primeras 8 son la paleta real de la cinta.
   for (int i = 0; i < 8; i++) {
     uint8_t *entry = &header[54 + i * 4];
     entry[0] = PALETTE[i].b;
@@ -579,56 +598,67 @@ void openNewPage() {
     entry[2] = PALETTE[i].r;
     entry[3] = 0;
   }
-
   pageFile.write(header, sizeof(header));
 
-  bandBase = 0;
-  cursorX = leftMarginDots;
-  cursorY = 0;
-  rowsWrittenToFile = 0;
-  pageHasInk = false;
-  maxYUsed = -1;
-  memset(band, COLOR_WHITE_INDEX, BAND_BYTES);
-  lineCellHeight = 0; lineMinAdvance = 0; // linea nueva arriba de la hoja
-  pageOpen = true;
+  // --- Hoja entera en blanco (indice 7 en los dos nibbles = 0x77). Escribir de verdad
+  // (y no solo hacer seek) es imprescindible: en FAT, extender un fichero con seek
+  // deja datos basura sin inicializar.
+  memset(whiteChunk, 0x77, sizeof(whiteChunk));
+  uint32_t remaining = total - BMP_HEADER_BYTES;
+  while (remaining > 0) {
+    uint32_t n = (remaining < sizeof(whiteChunk)) ? remaining : (uint32_t)sizeof(whiteChunk);
+    pageFile.write(whiteChunk, n);
+    remaining -= n;
+  }
+  pageFile.flush();
+  lastRowWritten = -2; // el puntero esta al final del fichero
 
-  bmpCacheBytes = 0; // la cache PSRAM empieza de cero para cada pagina nueva
-  cacheAppend(header, sizeof(header));
+  // --- Cache PSRAM: copia completa de la hoja (cabecera + blanco). bmpCacheBytes solo
+  // se fija al final: el servidor web nunca ve una cache a medio inicializar.
+  bmpCacheBytes = 0;
+  if (bmpCacheBuffer && bmpCacheCapacity >= total) {
+    memcpy(bmpCacheBuffer, header, sizeof(header));
+    memset(bmpCacheBuffer + BMP_HEADER_BYTES, 0x77, total - BMP_HEADER_BYTES);
+    bmpCacheBytes = total;
+  }
 
-  patchHeaderNow(); // deja la cabecera (en la SD y en la cache) coherente: BMP_HEADER_BYTES/0
-
+  pageFileCreated = true;
   writingToSD = false;
   updateStatusLed();
   sdAccessEnd();
 
   Serial.printf("[INFO] Nueva pagina: %s\n", currentFileName);
+  return true;
 }
 
-void flushOneRow() {
-  // Vuelca a la SD la fila mas antigua del buffer (bandBase) y la deja en blanco
-  // para poder reutilizar ese hueco.
-  if (!pageOpen) { bandBase++; return; }
-  uint32_t rs = rowSizeBytes();
-  uint8_t rowBuf[PAGE_WIDTH_DOTS / 2 + 4]; // +4: margen para el relleno a multiplo de 4
-  memset(rowBuf, 0, sizeof(rowBuf));
-  int32_t rel = bandBase % BAND_HEIGHT;
-  if (rel < 0) rel += BAND_HEIGHT;
-  for (int x = 0; x < PAGE_WIDTH_DOTS; x++) {
-    uint8_t idx = band[rel][x];
-    if (idx == COLOR_WHITE_INDEX) idx = 7; // blanco = entrada 7 de la paleta
-    // 2 pixeles por byte: el primero (x par) va en el nibble alto, el
-    // segundo (x impar) en el nibble bajo -- orden estandar de BMP 4bpp.
-    if (x & 1) rowBuf[x / 2] |= (idx & 0x0F);
-    else       rowBuf[x / 2] |= (idx & 0x0F) << 4;
-  }
-  // el resto de rowBuf (relleno a multiplo de 4) ya quedo a 0 por el memset
+void plotDot(int32_t x, int32_t y, uint8_t colorIndex) {
+  if (x < 0 || x >= PAGE_WIDTH_DOTS || y < 0 || y >= PAGE_HEIGHT_DOTS) return;
+  if (!pageFileCreated && !materializePage()) return; // primer punto con tinta: se crea el fichero
+  ensureBandCovers(y);
+  int32_t rel = y % BAND_HEIGHT; // buffer en anillo: mismo indexado que usan writeBackRow()/loadRow()
+  band[rel][x] = colorIndex;
+  bandDirty[rel] = 1;
+  pageHasInk = true;
+  if (y > maxYUsed) maxYUsed = y;
+}
 
-  pageFile.write(rowBuf, rs); // una unica escritura, en vez de datos+relleno por separado
-  cacheAppend(rowBuf, rs);
-
-  memset(band[rel], COLOR_WHITE_INDEX, PAGE_WIDTH_DOTS);
-  bandBase++;
-  rowsWrittenToFile++;
+// Abre una pagina nueva en el sentido LOGICO (posicion, buffer de bandas en blanco...). No toca la
+// SD: el fichero se crea al primer punto con tinta (materializePage()).
+void openNewPage() {
+  bandBase = 0;
+  cursorX = leftMarginDots;
+  cursorY = 0;
+  pageHasInk = false;
+  maxYUsed = -1;
+  memset(band, COLOR_WHITE_INDEX, BAND_BYTES);
+  memset(bandDirty, 0, sizeof(bandDirty));
+  memset(rowWrittenBits, 0, sizeof(rowWrittenBits));
+  lastRowWritten = -2;
+  lineCellHeight = 0; lineMinAdvance = 0; // linea nueva arriba de la hoja
+  pageFileCreated = false;
+  currentFileName[0] = 0;
+  bmpCacheBytes = 0; // la cache de la pagina anterior ya no vale
+  pageOpen = true;
 }
 
 void closePage() {
@@ -636,22 +666,18 @@ void closePage() {
 
   if (USE_XONXOFF) Serial2.write((uint8_t)0x13); // XOFF: puede tardar en escribir en SD
 
-  sdWriteBegin();
-
-  // Volcar todo lo que quede en el buffer y, ademas, rellenar de blanco el
-  // resto de la hoja hasta la altura fija PAGE_HEIGHT_DOTS: asi todas las
-  // paginas generadas miden siempre lo mismo (aspecto de hoja A4), tanto si
-  // el cierre lo provoca un Form Feed a mitad de hoja como si lo provoca
-  // haber llegado justo al final.
-  while (bandBase < PAGE_HEIGHT_DOTS) flushOneRow();
-
-  patchHeaderNow(); // cabecera final: alto y tamano coherentes con las PAGE_HEIGHT_DOTS filas ya escritas
-  pageFile.close();
-
-  sdWriteEnd();
-
-  Serial.printf("[INFO] Pagina cerrada: %s (%lu filas)\n", currentFileName, (unsigned long)rowsWrittenToFile);
+  if (pageFileCreated) {
+    sdWriteBegin();
+    // El fichero ya tiene el tamano definitivo: solo hay que escribir las filas de la
+    // ventana que sigan sin volcar.
+    for (int32_t y = bandBase; y < bandBase + BAND_HEIGHT; y++) writeBackRow(y);
+    pageFile.flush();
+    pageFile.close();
+    sdWriteEnd();
+    Serial.printf("[INFO] Pagina cerrada: %s (%lu filas)\n", currentFileName, (unsigned long)PAGE_HEIGHT_DOTS);
+  }
   pageOpen = false;
+  pageFileCreated = false;
 
   if (USE_XONXOFF) Serial2.write((uint8_t)0x11); // XON
 }
@@ -663,12 +689,16 @@ void finishPageIfNeeded() {
   if (pageOpen && pageHasInk) {
     closePage();
   } else if (pageOpen) {
-    // Pagina vacia: se descarta sin generar fichero util
-    sdWriteBegin();
-    pageFile.close();
-    SD.remove(currentFileName);
+    // Pagina vacia: se descarta (si no llego a crearse fichero, no hay nada que borrar)
+    if (pageFileCreated) {
+      sdWriteBegin();
+      pageFile.close();
+      SD.remove(currentFileName);
+      pageIndex--; // el numero queda libre para la siguiente pagina
+      sdWriteEnd();
+    }
     pageOpen = false;
-    sdWriteEnd();
+    pageFileCreated = false;
   }
 }
 
