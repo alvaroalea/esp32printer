@@ -10,8 +10,8 @@
  * Interpreta texto y graficos de puntos, los "pinta" en un lienzo virtual
  * y, cada vez que llega un salto de pagina (Form Feed) o pasan unos segundos
  * sin actividad, vuelca la pagina completa a un fichero BMP indexado de 8
- * bits (paleta de 256 colores, de los que hoy se usan 8; formato BI_RGB sin
- * comprimir) en la SD.
+ * bits (paleta de 256 colores RYBK para varias pasadas, ver paleta_ryb.h;
+ * formato BI_RGB sin comprimir) en la SD.
  *
  * ---------------------------------------------------------------------
  * HARDWARE ESPERADO (ajustar en la seccion CONFIGURACION):
@@ -103,6 +103,7 @@
 #include <freertos/semphr.h>
 #include "font5x7.h"
 #include "font8x8.h"
+#include "paleta_ryb.h" // paleta de 256 colores RYBK para varias pasadas (ver su cabecera)
 #ifndef IADEVEL
 #include "roman.h"
 #include "courier.h"
@@ -200,9 +201,7 @@
 #define SD_RETRY_INTERVAL_MS 5000UL // cada cuanto se reintenta remontar la SD si fallo
 
 // ================================ PALETA DE COLOR ==========================
-// Aproximacion de los colores tipicos de una cinta de 4 bandas (K/C/M/Y)
-// tal y como los seleccionaba el comando ESC r n de las Epson JX-80/LQ color.
-struct RGB { uint8_t r, g, b; };
+// Colores: ver paleta_ryb.h (cinta Rojo/Amarillo/Azul/Negro, varias pasadas, 256 colores).
 
 // Declarado aqui (y no junto a chooseFont()/drawChar() mas abajo) porque el
 // IDE de Arduino genera automaticamente los prototipos de las funciones y
@@ -240,26 +239,14 @@ void updateStatusLed();
 // el autoConnect() bloqueante de WiFiManager no retrase el arranque de la
 // emulacion de impresora ni un segundo.
 void startWifiWebTask();
-static const RGB PALETTE[8] = {
-  {0,   0,   0  },  // 0 Negro
-  {216, 0,   132},  // 1 Magenta
-  {0,   174, 219},  // 2 Cian
-  {102, 45,  145},  // 3 Violeta (magenta+cian)
-  {255, 221, 0  },  // 4 Amarillo
-  {237, 28,  36 },  // 5 Rojo/naranja (magenta+amarillo)
-  {0,   166, 81 },  // 6 Verde (cian+amarillo)
-  {255, 255, 255},  // 7 Blanco (no usado como tinta, solo de referencia)
-};
-#define PALETTE_USED 8         // colores definidos hoy en PALETTE (negro, 3 primarios, 3 mezclas y blanco)
-#define COLOR_WHITE_INDEX 7    // "sin tinta" en el buffer = blanco del papel = entrada 7 de la paleta: el indice del
-                               // buffer (band[]) es directamente el indice de paleta que se guarda en el fichero
+#define COLOR_WHITE_INDEX RYBK_WHITE_INDEX // "sin tinta" = papel blanco = indice 0 de la paleta RYBK: el indice de
+                                           // band[] es directamente el indice de paleta que se guarda en el fichero
 
-// --- Formato de fichero: BMP INDEXADO de 8 bits (1 byte por pixel) con una
-// paleta de 256 entradas, aunque hoy solo se usen PALETTE_USED=8 (negro,
-// magenta, cian, violeta, amarillo, rojo, verde y blanco): las entradas
-// PALETTE_USED..255 se rellenan con blanco (el papel) y quedan libres para
-// anadir colores en el futuro sin cambiar el formato. El indice de band[] se
-// escribe tal cual en el fichero (sin empaquetar). Cada pagina ocupa ~2.8MB.
+// --- Formato de fichero: BMP INDEXADO de 8 bits (1 byte por pixel) con la
+// paleta de 256 entradas de paleta_ryb.h: el indice es un mapa de bits de
+// tinta (nibble bajo = 1a pasada, nibble alto = 2a) para sumar colores al
+// imprimir varias veces sobre el mismo punto. El indice de band[] se escribe
+// tal cual en el fichero (sin empaquetar). Cada pagina ocupa ~2.8MB.
 #define BMP_BITS_PER_PIXEL 8
 #define BMP_PALETTE_COLORS 256                              // entradas de la tabla de color (indices 0..255)
 #define BMP_HEADER_BYTES (54 + BMP_PALETTE_COLORS * 4)      // cabecera + tabla de color (54 + 1024 = 1078)
@@ -276,7 +263,7 @@ int32_t cursorY = 0;            // posicion vertical actual dentro de la pagina,
 int32_t leftMarginDots = 0;                 // ESC l n : margen izquierdo en puntos (ya convertido con el CPI de ese momento)
 int32_t rightMarginDots = PAGE_WIDTH_DOTS;  // ESC Q n : margen derecho en puntos, medido desde el borde izquierdo
 int32_t lineSpacingDots = DEFAULT_LINE_DOTS;
-uint8_t currentColor = 0;       // indice de PALETTE, por defecto negro
+uint8_t currentColor = 0;       // numero de color de ESC r (0..6; ver RYBK_ESC_R_MASK en paleta_ryb.h), por defecto negro
 bool boldMode = false;
 bool underlineMode = false;
 bool overscoreMode = false;     // ESC _ n : linea sobre la primera fila del caracter
@@ -583,13 +570,12 @@ bool materializePage() {
   header[42] = 0x12; header[43] = 0x0B; // idem, Y
   // bytes 46..49 (colores en la paleta) y 50..53 (colores importantes) a 0 = "el maximo
   // del bit depth" (256), convencion estandar.
-  // Tabla de color (256 entradas x 4 bytes BGR0): las PALETTE_USED primeras son la paleta real
-  // de la cinta; el resto (libres para el futuro) se rellena con blanco, el color del papel.
+  // Tabla de color (256 entradas x 4 bytes BGR0): los 256 colores de paleta_ryb.h (rybkColor).
   for (int i = 0; i < BMP_PALETTE_COLORS; i++) {
     uint8_t *entry = &header[54 + i * 4];
-    if (i < PALETTE_USED) { entry[0] = PALETTE[i].b; entry[1] = PALETTE[i].g; entry[2] = PALETTE[i].r; }
-    else                  { entry[0] = 255;          entry[1] = 255;          entry[2] = 255; }
-    entry[3] = 0;
+    uint8_t r, g, b;
+    rybkColor((uint8_t)i, &r, &g, &b);
+    entry[0] = b; entry[1] = g; entry[2] = r; entry[3] = 0;
   }
   pageFile.write(header, BMP_HEADER_BYTES);
 
@@ -624,12 +610,44 @@ bool materializePage() {
   return true;
 }
 
+// --- "Mascara de pasada": una pasada de la cabeza golpea cada punto UNA sola vez. Dentro de
+// una misma operacion de dibujo (un caracter, un bloque grafico) un pixel puede pintarse
+// varias veces sin que sea otra pasada: negrita (copia desplazada 1 punto), subrayado o
+// sobrerrayado que tocan la fila del glifo, o graficos de mas de 180dpi cuyas columnas de
+// origen caen en el mismo pixel. Para que eso NO cuente como segunda pasada (y no oscurezca
+// esos pixeles), cada operacion abre una mascara de bits sobre su zona (beginPassMask) y
+// plotDot() ignora los pixeles que la operacion ya ha pintado. Volver a imprimir sobre el
+// mismo sitio (CR, otra operacion) SI es una pasada nueva: se suma al color existente.
+static uint8_t passBits[4608];   // 36864 bits: cabe un caracter (<= ~140 x 128) y un bloque grafico (1440 x 24)
+bool     passActive = false;
+int32_t  passX0 = 0, passY0 = 0;
+uint16_t passW = 0, passH = 0;
+
+void beginPassMask(int32_t x0, int32_t y0, int32_t w, int32_t h) {
+  if (x0 < 0) { w += x0; x0 = 0; }                      // recortar a la hoja
+  if (x0 + w > PAGE_WIDTH_DOTS) w = PAGE_WIDTH_DOTS - x0;
+  if (y0 < 0) { h += y0; y0 = 0; }
+  if (w <= 0 || h <= 0 || (uint32_t)w * (uint32_t)h > sizeof(passBits) * 8) { passActive = false; return; } // sin mascara: se pinta sin deduplicar
+  passX0 = x0; passY0 = y0; passW = (uint16_t)w; passH = (uint16_t)h;
+  memset(passBits, 0, ((uint32_t)w * h + 7) / 8);
+  passActive = true;
+}
+void endPassMask() { passActive = false; }
+
+// Pinta un punto con el color de ESC r 'colorIndex' (0..6), SUMANDO las tintas a lo que ya hubiera
+// en el pixel (paleta_ryb.h, rybkPaint): 1a pasada -> nibble bajo, 2a -> nibble alto.
 void plotDot(int32_t x, int32_t y, uint8_t colorIndex) {
   if (x < 0 || x >= PAGE_WIDTH_DOTS || y < 0 || y >= PAGE_HEIGHT_DOTS) return;
+  if (passActive && x >= passX0 && x < passX0 + passW && y >= passY0 && y < passY0 + passH) {
+    uint32_t bit = (uint32_t)(y - passY0) * passW + (uint32_t)(x - passX0);
+    if (passBits[bit >> 3] & (1 << (bit & 7))) return; // esta pasada ya golpeo este punto
+    passBits[bit >> 3] |= (uint8_t)(1 << (bit & 7));
+  }
   if (!pageFileCreated && !materializePage()) return; // primer punto con tinta: se crea el fichero
   ensureBandCovers(y);
   int32_t rel = y % BAND_HEIGHT; // buffer en anillo: mismo indexado que usan writeBackRow()/loadRow()
-  band[rel][x] = colorIndex;
+  uint8_t inkMask = (colorIndex <= 6) ? RYBK_ESC_R_MASK[colorIndex] : (uint8_t)INK_K;
+  band[rel][x] = rybkPaint(band[rel][x], inkMask);
   bandDirty[rel] = 1;
   pageHasInk = true;
   if (y > maxYUsed) maxYUsed = y;
@@ -876,6 +894,9 @@ void drawChar(uint8_t c) {
   int32_t cellTop = cursorY + (lineCellHeight - layoutHeight);
   int32_t yBase = cellTop - winStart + scriptOffset; // y de la fila 0 del glifo (la ventana empieza en cellTop)
 
+  // Una misma pasada: lo que este caracter pinte dos veces en un pixel (negrita, subrayado...) cuenta una sola vez.
+  beginPassMask(cursorX - 32, cellTop, advance + 64, layoutHeight); // margen lateral para la cizalla de la cursiva
+
   // Cursiva por cizalladura continua: cada fila del caracter se desplaza un
   // poco mas hacia la derecha cuanto mas arriba esta (fila 0 = la de mas
   // desplazamiento, la ultima fila = sin desplazamiento), dando el lean
@@ -923,6 +944,7 @@ void drawChar(uint8_t c) {
     if (overscoreMode && !(halfActive && halfMode == 2))  // sobrerrayado: primera fila(s) de la celda del caracter
       drawScoreLine(cellTop, pitch, scaleX, lineThick);
   }
+  endPassMask();
 }
 
 // ================================ BUFFER DE LINEA ===========================
@@ -1061,6 +1083,10 @@ void startGraphicsCapture(uint8_t pins, uint16_t dpi) {
 //  - alto: gfxDotH filas por aguja (3 en 8 agujas, 1 en 24).
 void plotGraphicsColumn() {
   int32_t c = gfxColIndex;
+  if (c == 0) { // primera columna del bloque: todo el bloque es UNA pasada (las columnas >180dpi que caen en un mismo pixel no se suman)
+    int32_t blockW = ((int32_t)gfxNumCols * 180) / gfxDpi + 1;
+    beginPassMask(gfxX0, cursorY, blockW, (int32_t)gfxPins * gfxDotH); // alto del bloque: 8x3 o 24x1 = 24 filas
+  }
   int32_t xa = gfxX0 + (c * 180) / gfxDpi;
   int32_t xb = gfxX0 + ((c + 1) * 180) / gfxDpi;
   if (xb <= xa) xb = xa + 1;
@@ -1081,6 +1107,7 @@ void plotGraphicsColumn() {
 
 // Fin del bloque: el cursor queda justo detras del ultimo punto, segun el dpi.
 void finishGraphicsBlock() {
+  endPassMask();
   cursorX = gfxX0 + ((int32_t)gfxNumCols * 180) / gfxDpi;
 }
 
