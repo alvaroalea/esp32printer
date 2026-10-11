@@ -58,6 +58,11 @@
  *     superior (4,6) o inferior (5,7) del caracter ampliado: la linea no crece
  *     (mitad de un doble = alto normal) y los caracteres salen el doble de
  *     anchos; sirve para carteles a dos colores (tabla ESC_H_* mas abajo).
+ *     Movimiento vertical (todo en una unidad interna de 1/3600" para que los
+ *     interlineados fraccionarios, 1/8" = 22,5 puntos, no acumulen error):
+ *     interlineado ESC 0/1/2/3 n/ESC + n y ESC A n (n/60", INMEDIATO: vale ya
+ *     para el siguiente LF), avance ESC J n y retroceso ESC j n (n/180"), y
+ *     posicion vertical ESC ( V (absoluta) / ESC ( v (relativa) con ESC ( U.
  *     ESC SP n: separacion extra a la derecha de cada caracter (n/180" en
  *     NLQ, n/120" en borrador); forma parte del paso, asi que tambien cuenta
  *     para el salto automatico, los margenes y los tabuladores.
@@ -176,6 +181,7 @@
 #define LINE_BUFFER_CHARS 512       // caracteres que caben en el buffer de linea (>=256; 12 bytes cada uno = 6KB). Si se llena, se dibuja lo acumulado y se sigue.
 #define LINE_IDLE_FLUSH_MS 3000UL   // si el host se calla este tiempo con texto sin terminar (sin LF/CR/FF), se dibuja igualmente
 #define DEL_CLEARS_WHOLE_LINE false // DEL (0x7F): false = borra solo el ULTIMO caracter del buffer (ESC/P real); true = borra todo el buffer como CAN
+#define ESC_2_SELECTS_PROGRAMMED_SPACING false // ESC 2: false = siempre 1/6" (texto de la referencia Epson ESC/P2); true = aplica el ultimo valor de ESC A (convencion IBM/FX, donde ESC A solo programaba)
 #define ESC_R_RESETS_TABS  true     // ESC R sin parametro = restaurar tabuladores de fabrica (modo IBM/Epson). false = ESC R n (juego internacional de caracteres, n se descarta)
 #define MAX_HTABS          32       // tabuladores horizontales maximos de ESC D
                                      // (desborda a los ~49.7 dias), asi que 10 minutos caben
@@ -295,9 +301,35 @@ int32_t  hTabStops[MAX_HTABS];
 uint8_t  hTabCount = 0;
 uint8_t  hTabMode = 0;        // 0 = de fabrica (cada 8 columnas del paso vigente), 1 = lista ESC D, 2 = incremento fijo ESC e 0 n
 int32_t  hTabFixedDots = 0;
-int32_t  vTabIncDots = 0;     // ESC e 1 n : VT salta al siguiente multiplo (desde arriba de la hoja); 0 = VT actua como LF
 uint8_t  escParam = 0;        // parametro intermedio de comandos ESC de varios bytes
 uint16_t escWord = 0;
+
+// --- Posicion y movimiento VERTICAL. La unidad interna es 1/3600" (1 punto de 180dpi = 20
+// unidades): asi 1/8" = 450, 7/72" = 350, n/360" = 10n, n/180" = 20n, n/60" = 60n... son todos
+// enteros exactos y una pagina entera de lineas fraccionarias no acumula error. cursorY sigue
+// siendo la fila en puntos donde se pinta; cursorYSub guarda la fraccion de punto (0..19).
+#define UNITS_PER_DOT 20
+#define DEFAULT_LINE_U 600              // 1/6" = 600/3600"
+int32_t cursorYSub = 0;                 // fraccion de punto de cursorY, en 1/3600"
+int32_t lineSpacingU = DEFAULT_LINE_U;  // interlineado vigente (lo que avanza un LF), en 1/3600"
+int32_t progLineU = DEFAULT_LINE_U;     // ultimo valor dado por ESC A n (ESC A ya lo aplica al instante; solo lo usa ESC 2 si ESC_2_SELECTS_PROGRAMMED_SPACING)
+int32_t vUnitU = 10;                    // unidad de ESC ( V / ESC ( v, en 1/3600" (por defecto 1/360"; ESC ( U la cambia)
+int32_t vTabIncU = 0;                   // ESC e 1 n : VT salta al siguiente multiplo (desde arriba de la hoja); 0 = VT actua como LF
+uint8_t  parenCmd = 0;                  // ESC ( c : letra del comando
+uint16_t parenLen = 0, parenCount = 0;  // longitud declarada de sus datos y bytes ya recibidos
+uint8_t  parenBuf[8];                   // primeros bytes de datos (los comandos soportados usan 1 o 2)
+
+void setLineSpacingU(int32_t u) {
+  lineSpacingU = u;
+  lineSpacingDots = (u + UNITS_PER_DOT / 2) / UNITS_PER_DOT; // aproximacion en puntos para los calculos de alto de linea
+}
+int32_t cursorYUnits() { return cursorY * UNITS_PER_DOT + cursorYSub; }
+void setCursorYUnits(int32_t u) { // posicion vertical absoluta en 1/3600"; por encima de la hoja se queda arriba
+  if (u < 0) u = 0;
+  cursorY = u / UNITS_PER_DOT;
+  cursorYSub = u % UNITS_PER_DOT;
+}
+void moveYUnits(int32_t du) { setCursorYUnits(cursorYUnits() + du); }
 
 unsigned long lastByteMillis = 0;
 bool everReceivedByte = false;  // evita que el LED muestre "recibiendo" antes del primer byte real
@@ -350,6 +382,14 @@ enum EscState {
   ST_ESC_A,        // ESC a n           (justificacion)
   ST_ESC_H,        // ESC h n           (ancho+alto doble/cuadruple; 4..7 = medio caracter)
   ST_ESC_SP,       // ESC SP n          (separacion extra entre caracteres)
+  ST_ESC_ALINE,    // ESC A n           (interlineado n/60", se aplica al instante)
+  ST_ESC_PLUS,     // ESC + n           (interlineado n/360")
+  ST_ESC_J,        // ESC J n           (avanza el papel n/180")
+  ST_ESC_JREV,     // ESC j n           (retrocede el papel n/180")
+  ST_ESC_PAREN,    // ESC ( c nL nH ... (familia de comandos con longitud: letra de comando)
+  ST_ESC_PAREN_NL, //                   (longitud, byte bajo)
+  ST_ESC_PAREN_NH, //                   (longitud, byte alto)
+  ST_ESC_PAREN_DATA, //                 (datos)
   ST_ESC_D,        // ESC D n1..nk NUL  (tabuladores horizontales)
   ST_ESC_E_M,      // ESC e m n         (incremento fijo de tabulador: m)
   ST_ESC_E_N,      //                   (n)
@@ -659,6 +699,7 @@ void openNewPage() {
   bandBase = 0;
   cursorX = leftMarginDots;
   cursorY = 0;
+  cursorYSub = 0;
   pageHasInk = false;
   maxYUsed = -1;
   memset(band, COLOR_WHITE_INDEX, BAND_BYTES);
@@ -1049,9 +1090,10 @@ void resetPrinterState() {
   lineMinAdvance = 0;
   leftMarginDots = 0;
   rightMarginDots = PAGE_WIDTH_DOTS;
-  lineSpacingDots = DEFAULT_LINE_DOTS;
-  cursorX = 0;
-  cursorY = 0;
+  progLineU = DEFAULT_LINE_U;           // ESC @ restaura 1/6" y olvida lo programado con ESC A
+  setLineSpacingU(DEFAULT_LINE_U);
+  vUnitU = 10;                          // y la unidad de ESC ( V / ESC ( v
+  cursorX = 0;                          // (cursorY NO se toca: ESC @ no mueve el papel)
   typefaceMode = 1;
   lqMode = false;
   pitchMode = 0;
@@ -1064,7 +1106,7 @@ void resetPrinterState() {
   scriptMode = 0;
   lineBufCount = 0;
   justification = 0;
-  hTabMode = 0; hTabCount = 0; hTabFixedDots = 0; vTabIncDots = 0;
+  hTabMode = 0; hTabCount = 0; hTabFixedDots = 0; vTabIncU = 0;
 }
 
 void startGraphicsCapture(uint8_t pins, uint16_t dpi) {
@@ -1128,11 +1170,57 @@ uint8_t decodeNumericParam(uint8_t b) {
 // pisarian con la linea siguiente). Con texto normal lineMinAdvance es 0 y
 // el comportamiento es el de siempre.
 void doLineFeed() {
-  int32_t adv = lineSpacingDots;
-  if (lineMinAdvance > adv) adv = lineMinAdvance;
-  cursorY += adv;
+  int32_t adv = lineSpacingU;
+  int32_t minU = lineMinAdvance * UNITS_PER_DOT;
+  if (minU > adv) adv = minU;
+  moveYUnits(adv);
   lineCellHeight = 0;
   lineMinAdvance = 0;
+}
+
+// Mueve el papel en vertical SIN tocar la posicion horizontal (ESC J, ESC j, ESC ( v): antes se
+// dibuja el texto pendiente en su sitio, y lo que venga despues es una linea nueva (nueva linea base).
+void verticalMove(int32_t du) {
+  flushLineBuffer();
+  moveYUnits(du);
+  lineCellHeight = 0; lineMinAdvance = 0;
+}
+void verticalSet(int32_t u) { // posicion vertical absoluta (ESC ( V)
+  flushLineBuffer();
+  setCursorYUnits(u);
+  lineCellHeight = 0; lineMinAdvance = 0;
+}
+
+// Ejecuta un comando de la familia ESC ( c nL nH datos, una vez recibidos todos sus datos.
+// Los que no se conocen se descartan ENTEROS (si no, sus datos saldrian impresos como texto).
+void runParenCommand() {
+  uint16_t n = parenLen;
+  switch (parenCmd) {
+    case 'V': // ESC ( V 2 0 mL mH: posicion vertical ABSOLUTA = m x unidad, desde arriba de la hoja
+      if (n == 2) {
+        int32_t pos = (int32_t)((uint16_t)(parenBuf[0] | (parenBuf[1] << 8))) * vUnitU;
+        if (pos < (int32_t)PAGE_HEIGHT_DOTS * UNITS_PER_DOT) verticalSet(pos);
+        else Serial.println("[DEBUG] ESC ( V: posicion mas alla del final de la hoja: se ignora");
+        return;
+      }
+      break;
+    case 'v': // ESC ( v 2 0 mL mH: posicion vertical RELATIVA (entero con signo, + baja, - sube) = m x unidad
+      if (n == 2) {
+        int32_t d = (int32_t)(int16_t)(parenBuf[0] | (parenBuf[1] << 8)) * vUnitU;
+        verticalMove(d);
+        return;
+      }
+      break;
+    case 'U': // ESC ( U 1 0 m: unidad = m/3600"  (m = 5, 10, 20, 30, 40, 50 o 60)
+      if (n == 1) {
+        uint8_t m = parenBuf[0];
+        if (m == 5 || m == 10 || m == 20 || m == 30 || m == 40 || m == 50 || m == 60) vUnitU = m;
+        else Serial.printf("[DEBUG] ESC ( U %u: unidad no valida: se ignora\n", m);
+        return;
+      }
+      break;
+  }
+  Serial.printf("[DEBUG] Comando ESC ( %c (%u bytes de datos) no soportado: se descarta\n", (char)parenCmd, (unsigned)n);
 }
 
 // LF: vuelca el texto pendiente de la linea, avanza y (AUTO_CR_ON_LF) vuelve al margen izquierdo.
@@ -1182,9 +1270,9 @@ void handleByteInner(uint8_t b) {
           if (AUTO_LF_ON_CR) doLineFeed();
           return;
         case 0x0B: // VT: tabulador vertical (ESC e 1 n); sin tabuladores definidos actua como LF
-          if (vTabIncDots > 0) {
+          if (vTabIncU > 0) {
             flushLineBuffer();
-            cursorY = ((cursorY / vTabIncDots) + 1) * vTabIncDots;
+            setCursorYUnits(((cursorYUnits() / vTabIncU) + 1) * vTabIncU);
             lineCellHeight = 0; lineMinAdvance = 0;
             if (AUTO_CR_ON_LF) cursorX = leftMarginDots;
           } else {
@@ -1247,8 +1335,14 @@ void handleByteInner(uint8_t b) {
     case ST_ESC:
       switch (b) {
         case '@': flushLineBuffer(); resetPrinterState(); escState = ST_NORMAL; return;      // ESC @ (el texto pendiente se imprime antes)
-        case '2': lineSpacingDots = DEFAULT_LINE_DOTS; escState = ST_NORMAL; return; // 1/6"
-        case '0': lineSpacingDots = 23; escState = ST_NORMAL; return;     // 1/8" (aprox)
+        case '2': setLineSpacingU(ESC_2_SELECTS_PROGRAMMED_SPACING ? progLineU : DEFAULT_LINE_U); escState = ST_NORMAL; return; // ESC 2: 1/6" (o el ultimo ESC A, segun el define de arriba)
+        case '0': setLineSpacingU(450); escState = ST_NORMAL; return;     // ESC 0: 1/8" exacto (22,5 puntos)
+        case '1': setLineSpacingU(350); escState = ST_NORMAL; return;     // ESC 1: 7/72" exacto (17,5 puntos)
+        case 'A': escState = ST_ESC_ALINE; return;                        // ESC A n: interlineado n/60" inmediato
+        case '+': escState = ST_ESC_PLUS; return;                         // ESC + n: n/360"
+        case 'J': escState = ST_ESC_J; return;                            // ESC J n: avanza el papel n/180"
+        case 'j': escState = ST_ESC_JREV; return;                         // ESC j n: retrocede el papel n/180"
+        case '(': escState = ST_ESC_PAREN; return;                        // ESC ( c nL nH datos
         case '3': escState = ST_ESC_3; return;                            // ESC 3 n
         case 'E': boldMode = true;  escState = ST_NORMAL; return;         // negrita ON
         case 'F': boldMode = false; escState = ST_NORMAL; return;         // negrita OFF
@@ -1268,7 +1362,7 @@ void handleByteInner(uint8_t b) {
         case '$': escState = ST_ESC_DOLLAR_L; return;                    // ESC $ nL nH: posicion horizontal absoluta
         case '\\': escState = ST_ESC_BSLASH_L; return;                    // ESC \ nL nH: posicion horizontal relativa
         case 'R':                                                        // ESC R: tabuladores de fabrica (modo IBM) / juego internacional (modo Epson)
-          if (ESC_R_RESETS_TABS) { hTabMode = 0; hTabCount = 0; vTabIncDots = 0; escState = ST_NORMAL; }
+          if (ESC_R_RESETS_TABS) { hTabMode = 0; hTabCount = 0; vTabIncU = 0; escState = ST_NORMAL; }
           else escState = ST_ESC_SKIP1; // ESC R n: n se descarta
           return;
         case '*': flushLineBuffer(); escState = ST_ESC_STAR_M; return;   // grafico ESC *
@@ -1312,8 +1406,36 @@ void handleByteInner(uint8_t b) {
       return;
 
     case ST_ESC_3:
-      lineSpacingDots = b; // ESC 3 n -> n/180" == n puntos a nuestra resolucion de 180dpi
+      setLineSpacingU((int32_t)b * UNITS_PER_DOT); // ESC 3 n -> n/180" == n puntos de 180dpi
       escState = ST_NORMAL;
+      return;
+
+    case ST_ESC_ALINE: // ESC A n: interlineado de n/60" (n = 0..85), INMEDIATO: lo usa ya el siguiente LF/retorno de carro
+      if (b <= 85) { progLineU = (int32_t)b * 60; setLineSpacingU(progLineU); }
+      else Serial.printf("[DEBUG] ESC A %u fuera de rango (0..85): se ignora\n", b);
+      escState = ST_NORMAL;
+      return;
+
+    case ST_ESC_PLUS: // ESC + n: interlineado de n/360" (inmediato)
+      setLineSpacingU((int32_t)b * 10);
+      escState = ST_NORMAL;
+      return;
+
+    case ST_ESC_J:    verticalMove((int32_t)b * UNITS_PER_DOT);  escState = ST_NORMAL; return; // ESC J n: n/180" hacia abajo
+    case ST_ESC_JREV: verticalMove(-(int32_t)b * UNITS_PER_DOT); escState = ST_NORMAL; return; // ESC j n: n/180" hacia arriba (tope: arriba de la hoja)
+
+    case ST_ESC_PAREN:    parenCmd = b; escState = ST_ESC_PAREN_NL; return;
+    case ST_ESC_PAREN_NL: parenLen = b; escState = ST_ESC_PAREN_NH; return;
+    case ST_ESC_PAREN_NH:
+      parenLen |= (uint16_t)b << 8;
+      parenCount = 0;
+      if (parenLen == 0) { runParenCommand(); escState = ST_NORMAL; }
+      else escState = ST_ESC_PAREN_DATA;
+      return;
+    case ST_ESC_PAREN_DATA:
+      if (parenCount < sizeof(parenBuf)) parenBuf[parenCount] = b;
+      parenCount++;
+      if (parenCount >= parenLen) { runParenCommand(); escState = ST_NORMAL; }
       return;
 
     case ST_ESC_MINUS:
@@ -1379,7 +1501,7 @@ void handleByteInner(uint8_t b) {
     case ST_ESC_E_M: escParam = decodeNumericParam(b); escState = ST_ESC_E_N; return;
     case ST_ESC_E_N:
       if (escParam == 0 && b > 0) { hTabFixedDots = (int32_t)b * computeColumnDots(); hTabMode = 2; } // horizontal: cada n columnas del paso vigente
-      else if (escParam == 1)      { vTabIncDots = (int32_t)b * lineSpacingDots; }                      // vertical: cada n lineas (0 = VT es LF)
+      else if (escParam == 1)      { vTabIncU = (int32_t)b * lineSpacingU; }                            // vertical: cada n lineas (0 = VT es LF)
       escState = ST_NORMAL;
       return;
 
