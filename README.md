@@ -58,5 +58,5 @@ Star LC 10 Colour basic demo from manual:
 Colour dump of QL's game loading screen, with sdump from miracle: 
 ![My image](sample2.png)
 
-Conected to a PC using Debian 13 (old, not actual funcionality):
+Conected to a PC using Debian 13 (need AUTO_CR_ON_LF = false):
 ![My image](sample3.png)
