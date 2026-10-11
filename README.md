@@ -30,6 +30,25 @@ the RGB led of the board indicate the state of the printer:
 * PURPLE - Printer is receiving data and start to print.
 * YELLOW - FF Button has been pressed and page is being "explused"
 
+## Future works:
+General TODO
+* Configurable settings via web.
+* Generate a PDF of each file.
+* Send the page (PDF) to a IPP printer automatically.
+
+Printer Emulation
+* Proporcional font.
+* Real NLQ fonts.
+* Fonts loadables and in RAM.
+* Country Setings, and slashed 0.
+* User configurable fonts.
+* Verify if ribbon (ink) is BYRK, or CYMK.
+
+Tests
+* Verify with Windows and Linux drivers.
+* Verify with BannerMania from MS-Dos.
+* Verify in other systems, ZX Spectrum, Amstrad, Enterprise.
+
 ## Actual Status
 These are examples of supported features:
 
@@ -39,5 +58,5 @@ Star LC 10 Colour basic demo from manual:
 Colour dump of QL's game loading screen, with sdump from miracle: 
 ![My image](sample2.png)
 
-Conected to a PC using Debian 13:
+Conected to a PC using Debian 13 (old, not actual funcionality):
 ![My image](sample3.png)
