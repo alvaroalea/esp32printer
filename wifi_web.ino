@@ -46,9 +46,10 @@
  *                      (la misma del primer arranque) sin borrar la red
  *                      guardada: sirve para cambiar los ajustes de la impresora
  *       /list          lista de todos los PAGEnnnn.BMP que hay en la SD, cada
- *                      uno con un boton [pdf] (si existe su PAGEnnnn.PDF) y
- *                      un boton para borrarlo (POST /delete, que borra el BMP
- *                      y su PDF)
+ *                      uno con un boton pdf (si existe su PAGEnnnn.PDF), un
+ *                      boton Print (POST /print: envia ese PDF por IPP a la
+ *                      URL ippUrl) y un boton para borrarlo (POST /delete,
+ *                      que borra el BMP y su PDF)
  *       /wifi-reset    borra la red WiFi guardada y reinicia (para volver
  *                      a configurar otra red)
  *
@@ -71,12 +72,13 @@
  */
 
 #include <WiFi.h>
+#include <WiFiClientSecure.h> // IPP por TLS (ipps://, https://) -- incluida en el nucleo ESP32 de Arduino
 #include <WiFiManager.h>   // libreria de terceros: "WiFiManager" de tzapu, aqui solo para el debug en PC.
 #include <ArduinoOTA.h>    // incluida en el nucleo ESP32 de Arduino
 #include <WebServer.h>     // incluida en el nucleo ESP32 de Arduino
 #include <freertos/task.h> // xTaskCreatePinnedToCore -- incluida en el nucleo ESP32 de Arduino
 
-#define WIFI_WEB_TASK_STACK_BYTES 8192 // subela si ves un stack overflow en esta tarea
+#define WIFI_WEB_TASK_STACK_BYTES 16384 // subela si ves un stack overflow en esta tarea (16K: el handshake TLS de IPP por ipps:// gasta mucha pila)
 #define WIFI_WEB_TASK_CORE 0           // nucleo 0: el bucle principal (impresora) corre en el 1
 #define WIFI_WEB_TASK_PRIORITY 1
 
@@ -269,6 +271,7 @@ void handleList() {
   String html = "<!DOCTYPE html><html><head><meta charset='utf-8'><title>Paginas</title>"
                  "<style>body{font-family:sans-serif}"
                  ".del{font-size:.7em;padding:0 .4em;margin-left:.4em;color:#b00;cursor:pointer}"
+                 ".prn{font-size:.7em;padding:0 .4em;margin-left:.4em;cursor:pointer}"
                  "a.pdf{font-size:.7em;padding:0 .4em;margin-left:.4em;border:1px solid #767676;border-radius:3px;"
                  "background:#efefef;color:#000;text-decoration:none}</style></head><body>"
                  "<h2>Paginas en la SD</h2><ul>";
@@ -289,10 +292,16 @@ void handleList() {
         if (pageOpen && pageFileCreated && href == String(currentFileName)) {
           html += " <small>(imprimiendose ahora)</small>"; // la hoja en curso no se puede borrar (y su PDF aun no existe)
         } else if (isPageFileName(bare)) {
-          // [pdf]: descarga del PDF de la hoja (PAGEnnnn.PDF), solo si existe. Los PDF no se listan aparte.
+          // pdf: descarga del PDF de la hoja (PAGEnnnn.PDF), solo si existe. Los PDF no se listan aparte.
           String pdfName = bare.substring(0, 8) + ".PDF";
-          if (SD.exists(("/" + pdfName).c_str()))
-            html += " <a class='pdf' href='/" + pdfName + "' download='" + pdfName + "' title='Descargar el PDF de la hoja'>[pdf]</a>";
+          if (SD.exists(("/" + pdfName).c_str())) {
+            html += " <a class='pdf' href='/" + pdfName + "' download='" + pdfName + "' title='Descargar el PDF de la hoja'>pdf</a>";
+            // Print: manda el PDF a la impresora IPP (ippUrl). POST + confirmacion, como Borrar (gasta papel).
+            html += " <form method='POST' action='/print' style='display:inline' "
+                    "onsubmit=\"return confirm('Enviar " + pdfName + " a la impresora IPP?')\">"
+                    "<input type='hidden' name='f' value='" + bare + "'>"
+                    "<button type='submit' class='prn' title='Imprimir el PDF en la impresora IPP'>Print</button></form>";
+          }
           // POST (no un enlace GET: un enlace podria borrarse al precargarlo el navegador o al
           // seguirlo un rastreador) + confirmacion en el navegador antes de enviar.
           html += " <form method='POST' action='/delete' style='display:inline' "
@@ -345,6 +354,360 @@ void handleDelete() {
   // 303 + Location: el navegador recarga /list con un GET, asi que F5 no repite el borrado.
   webServer.sendHeader("Location", "/list");
   webServer.send(303, "text/plain", "");
+}
+
+// ===== IPP CLIENT BEGIN =====
+// --- Impresion IPP del PDF de una hoja (boton "Print" de /list) ---
+// Envia el PDF a la impresora de ippUrl con una operacion IPP Print-Job (RFC 8011): un POST HTTP
+// con Content-Type application/ipp cuyo cuerpo es la peticion IPP (version 1.1, atributos
+// minimos) seguida de los bytes del documento (document-format application/pdf). ipp:// y http://
+// van en claro; ipps:// y https:// por TLS SIN validar el certificado (las impresoras usan
+// certificados autofirmados). Puertos por defecto: ipp/ipps 631, http 80, https 443. El
+// printer-uri que se manda es siempre ipp[s]://host:puerto/ruta, aunque la URL sea http[s]://.
+// Bloquea la tarea web mientras dura el envio (el servidor no atiende otras peticiones).
+#define IPP_CONNECT_TIMEOUT_MS    8000   // conectar con la impresora
+#define IPP_IO_TIMEOUT_MS        30000   // maximo sin poder enviar un solo byte
+#define IPP_RESPONSE_TIMEOUT_MS  90000   // espera de la respuesta tras enviar todo (la impresora procesa el trabajo)
+#define IPP_SEND_CHUNK_BYTES      8192   // trozo de lectura de la SD / escritura al socket
+#define IPP_USER_NAME "impresora-epson"  // requesting-user-name
+
+static uint8_t ippChunk[IPP_SEND_CHUNK_BYTES]; // estaticos: la pila de esta tarea es pequena
+static uint8_t ippHead[640];                   // peticion IPP (sin el documento)
+
+// Descompone una URL de impresora. Devuelve false si no es valida (esquema desconocido, host
+// vacio o demasiado largo, puerto incorrecto, IPv6 entre corchetes no soportado...).
+bool parseIppUrl(const char *url, bool *tls, char *host, size_t hostCap, uint16_t *port, char *path, size_t pathCap) {
+  uint16_t defPort;
+  if      (!strncmp(url, "ipp://", 6))   { *tls = false; defPort = 631; url += 6; }
+  else if (!strncmp(url, "ipps://", 7))  { *tls = true;  defPort = 631; url += 7; }
+  else if (!strncmp(url, "http://", 7))  { *tls = false; defPort = 80;  url += 7; }
+  else if (!strncmp(url, "https://", 8)) { *tls = true;  defPort = 443; url += 8; }
+  else return false;
+  size_t hl = 0;
+  while (url[hl] && url[hl] != ':' && url[hl] != '/') hl++;
+  if (hl == 0 || hl >= hostCap) return false;
+  memcpy(host, url, hl); host[hl] = 0; url += hl;
+  *port = defPort;
+  if (*url == ':') {
+    url++;
+    uint32_t pv = 0; int digits = 0;
+    while (*url >= '0' && *url <= '9') { pv = pv * 10 + (uint32_t)(*url - '0'); if (pv > 65535) return false; url++; digits++; }
+    if (digits == 0 || pv == 0) return false;
+    *port = (uint16_t)pv;
+  }
+  if (*url && *url != '/') return false;
+  const char *pp = *url ? url : "/";
+  if (strlen(pp) >= pathCap) return false;
+  strcpy(path, pp);
+  return true;
+}
+
+// Anade un atributo IPP (valor-tag, nombre, valor) en b[n..]. false si no cabe.
+bool ippPutAttr(uint8_t *b, size_t *n, size_t cap, uint8_t tag, const char *name, const char *value) {
+  size_t nl = strlen(name), vl = strlen(value);
+  if (*n + 5 + nl + vl > cap) return false;
+  size_t k = *n;
+  b[k++] = tag;
+  b[k++] = (uint8_t)(nl >> 8); b[k++] = (uint8_t)nl; memcpy(b + k, name, nl);  k += nl;
+  b[k++] = (uint8_t)(vl >> 8); b[k++] = (uint8_t)vl; memcpy(b + k, value, vl); k += vl;
+  *n = k;
+  return true;
+}
+
+// Peticion IPP Print-Job: version 1.1, operacion 0x0002, request-id 1, grupo de atributos de
+// operacion (charset, idioma, printer-uri, usuario, nombre del trabajo, formato PDF) y fin de
+// atributos (0x03). Los bytes del documento van justo detras. Devuelve su longitud, 0 si no cabe.
+size_t buildIppPrintJob(uint8_t *b, size_t cap, const char *printerUri, const char *jobName) {
+  if (cap < 16) return 0;
+  size_t n = 0;
+  b[n++] = 0x01; b[n++] = 0x01;                        // version 1.1
+  b[n++] = 0x00; b[n++] = 0x02;                        // Print-Job
+  b[n++] = 0x00; b[n++] = 0x00; b[n++] = 0x00; b[n++] = 0x01; // request-id
+  b[n++] = 0x01;                                       // operation-attributes-tag
+  if (!ippPutAttr(b, &n, cap, 0x47, "attributes-charset", "utf-8")) return 0;
+  if (!ippPutAttr(b, &n, cap, 0x48, "attributes-natural-language", "en")) return 0;
+  if (!ippPutAttr(b, &n, cap, 0x45, "printer-uri", printerUri)) return 0;
+  if (!ippPutAttr(b, &n, cap, 0x42, "requesting-user-name", IPP_USER_NAME)) return 0;
+  if (!ippPutAttr(b, &n, cap, 0x42, "job-name", jobName)) return 0;
+  if (!ippPutAttr(b, &n, cap, 0x49, "document-format", "application/pdf")) return 0;
+  if (n + 1 > cap) return 0;
+  b[n++] = 0x03;                                       // end-of-attributes-tag
+  return n;
+}
+
+// Envia todos los bytes (write() puede aceptar menos de los pedidos). false si el socket se
+// cierra, pasan IPP_IO_TIMEOUT_MS sin avanzar, o la impresora empieza a CONTESTAR antes de
+// haber recibido todo (se esta negando a aceptar el trabajo: connected() seguiria siendo true
+// mientras quede esa respuesta sin leer, y se esperaria en balde; ippPrintPdf() la lee despues).
+bool ippSendAll(WiFiClient *c, const uint8_t *p, size_t n) {
+  size_t off = 0;
+  uint32_t last = millis();
+  while (off < n) {
+    size_t w = c->write(p + off, n - off);
+    if (w > 0) { off += w; last = millis(); continue; }
+    if (c->available() > 0 || !c->connected() || (uint32_t)(millis() - last) > IPP_IO_TIMEOUT_MS) return false;
+    delay(1);
+  }
+  return true;
+}
+
+// Lee un byte de la respuesta; -1 si se cierra la conexion sin datos o vence deadline.
+int ippReadByte(WiFiClient *c, uint32_t deadline) {
+  while (true) {
+    if (c->available()) return c->read();
+    if (!c->connected() || (int32_t)(millis() - deadline) >= 0) return -1;
+    delay(1);
+  }
+}
+// Igual, con un presupuesto de bytes para no leer sin fin una respuesta rara.
+int ippGet(WiFiClient *c, uint32_t deadline, uint16_t *budget) {
+  if (*budget == 0) return -1;
+  (*budget)--;
+  return ippReadByte(c, deadline);
+}
+
+// Lee una linea HTTP (sin CR/LF) en buf. false si falla. Lo que sobre de la linea se descarta.
+bool ippReadLine(WiFiClient *c, uint32_t deadline, char *buf, size_t cap) {
+  size_t n = 0;
+  while (true) {
+    int ch = ippReadByte(c, deadline);
+    if (ch < 0) return false;
+    if (ch == '\n') break;
+    if (ch != '\r' && n + 1 < cap) buf[n++] = (char)ch;
+  }
+  buf[n] = 0;
+  return true;
+}
+
+// Lee la respuesta: linea de estado HTTP, cabeceras y, si es 200, el estado IPP (8 primeros bytes
+// del cuerpo) y, como mejora opcional, status-message y job-id. Devuelve true si llego el estado
+// IPP (ippStatus valido); si no, httpStatus dice hasta donde se llego (0 = sin respuesta).
+bool ippReadResponse(WiFiClient *c, uint32_t timeoutMs, int *httpStatus, int *ippStatus,
+                     char *statusMsg, size_t msgCap, uint32_t *jobId) {
+  uint32_t deadline = millis() + timeoutMs;
+  char line[160];
+  *httpStatus = 0; *ippStatus = -1; statusMsg[0] = 0; *jobId = 0;
+  bool chunked = false;
+  while (true) { // salta los "100 Continue" intermedios
+    if (!ippReadLine(c, deadline, line, sizeof(line))) return false;
+    const char *sp = strchr(line, ' ');
+    if (strncmp(line, "HTTP/", 5) != 0 || !sp) return false;
+    *httpStatus = atoi(sp + 1);
+    chunked = false;
+    while (true) { // cabeceras
+      if (!ippReadLine(c, deadline, line, sizeof(line))) return false;
+      if (line[0] == 0) break;
+      for (char *q = line; *q; q++) if (*q >= 'A' && *q <= 'Z') *q = (char)(*q + 32);
+      if (!strncmp(line, "transfer-encoding:", 18) && strstr(line, "chunked")) chunked = true;
+    }
+    if (*httpStatus != 100) break;
+  }
+  if (*httpStatus != 200) return false;
+  if (chunked && !ippReadLine(c, deadline, line, sizeof(line))) return false; // tamano del primer trozo (hex)
+  uint16_t budget = 2048;
+  uint8_t hd[8];
+  for (int i = 0; i < 8; i++) {
+    int ch = ippGet(c, deadline, &budget);
+    if (ch < 0) return false;
+    hd[i] = (uint8_t)ch;
+  }
+  *ippStatus = (hd[2] << 8) | hd[3];
+  // Mejora opcional (si algo falla, el estado ya esta): atributos de la respuesta
+  while (true) {
+    int t = ippGet(c, deadline, &budget);
+    if (t < 0 || t == 0x03) break;
+    if (t <= 0x0F) continue; // delimitador de grupo
+    int a = ippGet(c, deadline, &budget), b2 = ippGet(c, deadline, &budget);
+    if (a < 0 || b2 < 0) break;
+    int nl = (a << 8) | b2;
+    char name[24]; int nk = 0;
+    for (int i = 0; i < nl; i++) { int ch = ippGet(c, deadline, &budget); if (ch < 0) return true; if (nk < (int)sizeof(name) - 1) name[nk++] = (char)ch; }
+    name[nk] = 0;
+    a = ippGet(c, deadline, &budget); b2 = ippGet(c, deadline, &budget);
+    if (a < 0 || b2 < 0) break;
+    int vl = (a << 8) | b2;
+    uint8_t val[96]; int vk = 0;
+    for (int i = 0; i < vl; i++) { int ch = ippGet(c, deadline, &budget); if (ch < 0) return true; if (vk < (int)sizeof(val)) val[vk++] = (uint8_t)ch; }
+    if (nl == 0) continue; // valor adicional del atributo anterior
+    if (t == 0x41 && !strcmp(name, "status-message")) {
+      size_t m = (size_t)vk < msgCap - 1 ? (size_t)vk : msgCap - 1;
+      memcpy(statusMsg, val, m); statusMsg[m] = 0;
+    } else if (t == 0x21 && !strcmp(name, "job-id") && vl == 4 && vk == 4) {
+      *jobId = ((uint32_t)val[0] << 24) | ((uint32_t)val[1] << 16) | ((uint32_t)val[2] << 8) | val[3];
+    }
+  }
+  return true;
+}
+
+// Nombre del codigo de estado IPP (solo los habituales)
+const char *ippStatusName(int st) {
+  switch (st) {
+    case 0x0000: return "successful-ok";
+    case 0x0001: return "successful-ok-ignored-or-substituted-attributes";
+    case 0x0002: return "successful-ok-conflicting-attributes";
+    case 0x0400: return "client-error-bad-request";
+    case 0x0401: return "client-error-forbidden";
+    case 0x0402: return "client-error-not-authenticated";
+    case 0x0403: return "client-error-not-authorized";
+    case 0x0404: return "client-error-not-possible";
+    case 0x0405: return "client-error-timeout";
+    case 0x0406: return "client-error-not-found";
+    case 0x0408: return "client-error-request-entity-too-large";
+    case 0x040A: return "client-error-document-format-not-supported";
+    case 0x040B: return "client-error-attributes-or-values-not-supported";
+    case 0x0500: return "server-error-internal-error";
+    case 0x0501: return "server-error-operation-not-supported";
+    case 0x0502: return "server-error-service-unavailable";
+    case 0x0504: return "server-error-device-error";
+    case 0x0505: return "server-error-temporary-error";
+    case 0x0506: return "server-error-not-accepting-jobs";
+    case 0x0507: return "server-error-busy";
+    case 0x0508: return "server-error-job-canceled";
+    default:     return "";
+  }
+}
+
+// Envia el PDF pdfPath a la impresora ippUrl. true si la impresora acepto el trabajo (estado IPP
+// de la clase "successful", < 0x0100). msg recibe un texto para el usuario (exito o error).
+bool ippPrintPdf(const char *pdfPath, const char *jobName, char *msg, size_t msgCap) {
+  msg[0] = 0;
+  if (!ippUrl[0]) { snprintf(msg, msgCap, "No hay URL de impresora IPP configurada (usa Configurar impresora)."); return false; }
+  bool tls; char host[80]; uint16_t port; char path[128];
+  if (!parseIppUrl(ippUrl, &tls, host, sizeof(host), &port, path, sizeof(path))) {
+    snprintf(msg, msgCap, "URL de impresora IPP no valida: %s", ippUrl);
+    return false;
+  }
+  char uri[320];
+  snprintf(uri, sizeof(uri), "%s://%s:%u%s", tls ? "ipps" : "ipp", host, (unsigned)port, path);
+  size_t headLen = buildIppPrintJob(ippHead, sizeof(ippHead), uri, jobName);
+  if (!headLen) { snprintf(msg, msgCap, "La peticion IPP no cabe en el buffer (URL demasiado larga)."); return false; }
+
+  sdAccessBegin();
+  File f = SD.open(pdfPath, FILE_READ);
+  uint32_t size = f ? (uint32_t)f.size() : 0;
+  sdAccessEnd();
+  if (!f || size == 0) {
+    if (f) { sdAccessBegin(); f.close(); sdAccessEnd(); }
+    snprintf(msg, msgCap, "No se pudo abrir el PDF %s.", pdfPath);
+    return false;
+  }
+
+  WiFiClient plain;
+  WiFiClientSecure secure;
+  WiFiClient *c = &plain;
+  if (tls) { secure.setInsecure(); c = &secure; } // sin validar certificado (autofirmados)
+  Serial.printf("[IPP] Enviando %s (%lu bytes) a %s\n", pdfPath, (unsigned long)size, uri);
+  if (!c->connect(host, port, IPP_CONNECT_TIMEOUT_MS)) {
+    sdAccessBegin(); f.close(); sdAccessEnd();
+    snprintf(msg, msgCap, "No se pudo conectar con la impresora (%s:%u).", host, (unsigned)port);
+    return false;
+  }
+  c->setNoDelay(true);
+
+  char hdr[512];
+  int hl = snprintf(hdr, sizeof(hdr),
+                    "POST %s HTTP/1.1\r\nHost: %s:%u\r\nUser-Agent: ESP32-Epson-Emulator\r\n"
+                    "Content-Type: application/ipp\r\nContent-Length: %lu\r\nConnection: close\r\n\r\n",
+                    path, host, (unsigned)port, (unsigned long)(headLen + size));
+  bool netOk = (hl > 0 && hl < (int)sizeof(hdr)) && ippSendAll(c, (const uint8_t *)hdr, (size_t)hl) &&
+               ippSendAll(c, ippHead, headLen);
+  bool sdFail = false;
+  uint32_t left = size;
+  while (netOk && left > 0) {
+    size_t want = (left < sizeof(ippChunk)) ? left : sizeof(ippChunk);
+    sdAccessBegin();
+    size_t n = f.read(ippChunk, want);
+    sdAccessEnd();
+    if (n == 0) { sdFail = true; break; }
+    netOk = ippSendAll(c, ippChunk, n);
+    left -= (uint32_t)n;
+    yield();
+  }
+  sdAccessBegin(); f.close(); sdAccessEnd();
+  if (sdFail) {
+    c->stop();
+    snprintf(msg, msgCap, "Error leyendo el PDF de la SD; envio cancelado.");
+    return false;
+  }
+
+  // Si el envio se corto, la impresora a veces ha contestado antes de cerrar (p. ej. rechazando
+  // el trabajo): se intenta leer el motivo con poca espera.
+  int httpSt, ippSt; char smsg[96]; uint32_t jobId;
+  bool got = ippReadResponse(c, netOk ? IPP_RESPONSE_TIMEOUT_MS : 3000, &httpSt, &ippSt, smsg, sizeof(smsg), &jobId);
+  c->stop();
+
+  bool ok = false;
+  if (got && ippSt >= 0 && ippSt < 0x0100) {
+    ok = true;
+    int m = snprintf(msg, msgCap, "Trabajo enviado a la impresora (IPP 0x%04X %s", ippSt, ippStatusName(ippSt));
+    if (jobId && m > 0 && (size_t)m < msgCap) m += snprintf(msg + m, msgCap - (size_t)m, ", trabajo %lu", (unsigned long)jobId);
+    if (m > 0 && (size_t)m < msgCap) snprintf(msg + m, msgCap - (size_t)m, ").");
+  } else if (got) {
+    snprintf(msg, msgCap, "La impresora rechazo el trabajo: IPP 0x%04X %s%s%s", ippSt, ippStatusName(ippSt),
+             smsg[0] ? " - " : "", smsg);
+  } else if (httpSt == 426) {
+    snprintf(msg, msgCap, "La impresora exige conexion segura (HTTP 426): usa una URL ipps://.");
+  } else if (httpSt == 401 || httpSt == 403) {
+    snprintf(msg, msgCap, "La impresora pide autenticacion o no permite imprimir (HTTP %d).", httpSt);
+  } else if (httpSt != 0) {
+    snprintf(msg, msgCap, "Respuesta HTTP %d de la impresora (compruebe la ruta de la URL).", httpSt);
+  } else if (!netOk) {
+    snprintf(msg, msgCap, "Se corto la conexion con la impresora al enviar el PDF.");
+  } else {
+    snprintf(msg, msgCap, "La impresora no contesto (o la respuesta no es valida).");
+  }
+  Serial.printf("[IPP] %s %s\n", ok ? "OK:" : "ERROR:", msg);
+  return ok;
+}
+// ===== IPP CLIENT END =====
+
+// Escapa <, >, &, ' y " para meter un texto (p. ej. el mensaje de la impresora) en HTML
+String htmlEscape(const char *t) {
+  String o;
+  for (; *t; t++) {
+    switch (*t) {
+      case '<': o += "&lt;"; break;
+      case '>': o += "&gt;"; break;
+      case '&': o += "&amp;"; break;
+      case '\'': o += "&#39;"; break;
+      case '"': o += "&quot;"; break;
+      default: o += *t;
+    }
+  }
+  return o;
+}
+
+// --- /print (solo POST): envia el PDF de una hoja PAGEnnnn a la impresora IPP de ippUrl ---
+// Responde con una pagina con el resultado (no redirige: asi se ve el motivo si falla).
+void handlePrint() {
+  String f = webServer.arg("f");
+  if (!isPageFileName(f)) {
+    webServer.send(400, "text/plain", "Nombre de fichero no valido.");
+    return;
+  }
+  String bmpPath = "/" + f;
+  String pdfName = f.substring(0, 8) + ".PDF";
+  String pdfPath = "/" + pdfName;
+  bool printing, hasPdf;
+  sdAccessBegin();
+  printing = pageOpen && pageFileCreated && bmpPath == String(currentFileName);
+  hasPdf = SD.exists(pdfPath.c_str());
+  sdAccessEnd();
+  if (printing) {
+    webServer.send(409, "text/plain", "Esa pagina se esta imprimiendo ahora mismo: espere a que se cierre.");
+    return;
+  }
+  if (!hasPdf) {
+    webServer.send(404, "text/plain", "No existe " + pdfName + " en la SD.");
+    return;
+  }
+  char msg[256];
+  bool ok = ippPrintPdf(pdfPath.c_str(), pdfName.c_str(), msg, sizeof(msg));
+  String html = "<!DOCTYPE html><html><head><meta charset='utf-8'><title>Imprimir</title>"
+                "<meta name='viewport' content='width=device-width, initial-scale=1'>"
+                "<style>body{font-family:sans-serif}</style></head><body><h2>Imprimir " + htmlEscape(pdfName.c_str()) + "</h2><p>" +
+                (ok ? "&#10004; " : "&#10008; ") + htmlEscape(msg) + "</p><p><a href='/list'>Volver al listado</a></p></body></html>";
+  webServer.send(ok ? 200 : 502, "text/html", html);
 }
 
 // --- Sirve cualquier .BMP o .PDF que exista en la SD por su nombre de fichero
@@ -472,12 +835,12 @@ static void addPrinterParams(WiFiManager &wm) {
            "<br/><label><input type='checkbox' name='cfg_xonxoff' value='1'%s> Control de flujo por software (XON/XOFF)</label>"
            "<br/><label><input type='checkbox' name='cfg_autolf' value='1'%s> Auto LF: un CR tambien hace salto de linea</label>"
            "<br/><label><input type='checkbox' name='cfg_autocr' value='1'%s> Auto CR: un LF tambien vuelve al margen izquierdo</label>"
-           "<br/><label><input type='checkbox' name='cfg_autoprint' value='1'%s> Automatic print of complete page on configured IPP Printer</label>"
+           "<br/><label><input type='checkbox' name='cfg_autoprint' value='1'%s> Imprimir automaticamente al completar la hoja en la Impresora IPP preconfigurada</label>"
            "<br/>",
            useHwFlowControl ? " checked" : "", useXonXoff ? " checked" : "",
            autoLfOnCr ? " checked" : "", autoCrOnLf ? " checked" : "", autoIPPPrint ? " checked" : "");
 
-  static WiFiManagerParameter paramHead("<br/><b>Ajustes de la impresora</b>");
+  static WiFiManagerParameter paramHead("<br/><b>Ajustes de la impresora</b> ");
   static WiFiManagerParameter paramBaud("cfg_baud", "Baudios del puerto serie (300-1000000)", cfgBaudStr, 7,
                                         "type='number' min='300' max='1000000'");
   static WiFiManagerParameter paramFlags(cfgHtmlBuf); // HTML libre: lee cfgHtmlBuf cada vez que se dibuja la pagina
@@ -503,7 +866,7 @@ void handleConfigPortal() {
     "<!DOCTYPE html><html><head><meta charset='utf-8'><title>Configurar</title></head><body>"
     "<h2>Abriendo la pagina de configuracion</h2>"
     "<p>En unos segundos esta pagina dejara de responder. Conecta el movil u ordenador a la red WiFi "
-    "<b>" WIFI_CONFIG_AP_NAME "</b> y abre <b>http://192.168.4.1</b> (se abre sola en la mayoria de los "
+    "<b>" WIFI_CONFIG_AP_NAME "</b> y abre <a href=\"http://192.168.4.1\">http://192.168.4.1</a> (se abre sola en la mayoria de los "
     "casos) &rarr; <i>Configure WiFi</i>.</p>"
     "<p>Para cambiar <b>solo los ajustes de la impresora</b>, deja el SSID en blanco y pulsa <i>Save</i>: "
     "la red WiFi no se toca. El portal se cierra solo a los 3 minutos o con <i>Exit</i>.</p>"
@@ -566,6 +929,7 @@ void setupWifiOtaWeb() {
   webServer.on("/", handleRoot);
   webServer.on("/current.bmp", handleCurrentBmp);
   webServer.on("/list", handleList);
+  webServer.on("/print", HTTP_POST, handlePrint); // solo POST: envia el PDF a la impresora IPP
   webServer.on("/delete", HTTP_POST, handleDelete); // solo POST: un GET a /delete cae en onNotFound (404), nunca borra
   webServer.on("/config", handleConfigPortal);
   webServer.on("/wifi-reset", handleWifiReset);
