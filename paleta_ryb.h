@@ -31,10 +31,15 @@
 // nibble alto -> 0b11000100: el amarillo llega al 100% (2 pasadas) y el rojo queda en 80%
 // (una sola pasada, aunque su bit este en el nibble alto).
 //
-// El COLOR que se ve de cada indice (rybkColor) se calcula con un modelo sustractivo: cada tinta
-// es un filtro sobre el papel blanco con cobertura = 80% / 100% segun sus pasadas, y los
-// filtros se multiplican canal a canal. Se puede retocar todo en este fichero:
-// los colores de las tintas, los porcentajes por pasada y a que tintas equivale cada ESC r.
+// El COLOR que se ve de cada indice (rybkColor) se calcula con un modelo RYB (mezcla de pintura de
+// toda la vida): cada tinta R / Y / B tiene una cantidad (0%, RYBK_PASS1_PERCENT o RYBK_PASS2_PERCENT
+// segun sus pasadas) y el color sale de interpolar entre los 8 colores de las esquinas del cubo RYB
+// (RYBK_CORNER_RGB: papel, rojo, amarillo, naranja, azul, violeta, verde y las tres tintas juntas).
+// Asi cada tinta sola al 100% es EXACTAMENTE su color (rojo = 255,0,0) y las mezclas son las que
+// se esperan (rojo+amarillo = naranja, amarillo+azul = verde, rojo+azul = violeta), sin ensuciarse.
+// El negro (K) va aparte: oscurece el resultado en proporcion a su cobertura (80% -> queda el 20%
+// del brillo, 100% -> negro). Se puede retocar todo en este fichero: los colores de las esquinas,
+// los porcentajes por pasada y a que tintas equivale cada ESC r.
 
 #pragma once
 #include <Arduino.h>
@@ -51,12 +56,21 @@
 #define RYBK_PASS1_PERCENT  80  // una pasada
 #define RYBK_PASS2_PERCENT 100  // dos pasadas
 
-// --- Color de cada tinta al 100% sobre papel blanco, ordenado por NUMERO DE BIT: 0=K, 1=B, 2=Y, 3=R
-static const uint8_t RYBK_INK_RGB[4][3] = {
-  {   0,   0,   0 },   // bit 0  K  negro
-  {  60, 130, 210 },   // bit 1  B  azul
-  { 255, 225,  40 },   // bit 2  Y  amarillo
-  { 235,  60,  80 },   // bit 3  R  rojo
+// --- Colores de las 8 esquinas del cubo RYB: indice = (hay rojo ? 1 : 0) | (hay amarillo ? 2 : 0) | (hay azul ? 4 : 0),
+// con cada tinta presente al 100%. Los tres primeros colores puros (rojo, amarillo, azul) y el papel
+// son los colores "de manual"; los secundarios y el de las tres tintas se pueden ajustar a gusto.
+#define RYB_R 1
+#define RYB_Y 2
+#define RYB_B 4
+static const uint8_t RYBK_CORNER_RGB[8][3] = {
+  { 255, 255, 255 },   // 0            papel blanco
+  { 255,   0,   0 },   // R            rojo
+  { 255, 255,   0 },   // Y            amarillo
+  { 255, 128,   0 },   // R+Y          naranja
+  {   0,   0, 255 },   // B            azul
+  { 128,   0, 192 },   // R+B          violeta
+  {   0, 170,   0 },   // Y+B          verde
+  {  64,  32,   0 },   // R+Y+B        las tres tintas: marron oscuro
 };
 
 // --- ESC r n (n = 0..6) -> tintas que se usan. Los 7 colores de ESC/P eran negro, magenta, cian,
@@ -80,16 +94,24 @@ static inline uint8_t rybkPaint(uint8_t cur, uint8_t inkMask) {
 
 // Color RGB (0..255 por canal) del indice de paleta 'idx'. Aritmetica entera (sin float).
 static inline void rybkColor(uint8_t idx, uint8_t *r, uint8_t *g, uint8_t *b) {
+  // Cantidad de cada tinta en % segun sus pasadas (bit i del nibble bajo + bit i del alto)
+  uint32_t amt[4];
+  for (int i = 0; i < 4; i++) {
+    int passes = ((idx >> i) & 1) + ((idx >> (i + 4)) & 1);
+    amt[i] = (passes == 0) ? 0 : (passes == 1) ? RYBK_PASS1_PERCENT : RYBK_PASS2_PERCENT;
+  }
+  const uint32_t aR = amt[3], aY = amt[2], aB = amt[1], aK = amt[0];
+  // Interpolacion trilineal entre las 8 esquinas del cubo RYB (pesos en % x % x % = 0..1.000.000)
+  uint32_t acc[3] = { 0, 0, 0 };
+  for (int m = 0; m < 8; m++) {
+    uint32_t w = ((m & RYB_R) ? aR : 100 - aR) * ((m & RYB_Y) ? aY : 100 - aY) * ((m & RYB_B) ? aB : 100 - aB);
+    if (w == 0) continue;
+    for (int c = 0; c < 3; c++) acc[c] += w * RYBK_CORNER_RGB[m][c];
+  }
   uint8_t out[3];
   for (int c = 0; c < 3; c++) {
-    uint32_t v = 255; // papel blanco
-    for (int i = 0; i < 4; i++) {
-      int passes = ((idx >> i) & 1) + ((idx >> (i + 4)) & 1);
-      if (passes == 0) continue;
-      uint32_t cov = (passes == 1) ? RYBK_PASS1_PERCENT : RYBK_PASS2_PERCENT;       // % de cobertura
-      // v = v * (1 - cov * (1 - tinta/255)), con redondeo; 25500 = 100 * 255
-      v = (v * (25500UL - cov * (255UL - RYBK_INK_RGB[i][c])) + 12750UL) / 25500UL;
-    }
+    uint32_t v = (acc[c] + 500000UL) / 1000000UL;   // color RYB, redondeado
+    v = (v * (100 - aK) + 50) / 100;                // el negro oscurece en proporcion a su cobertura
     out[c] = (uint8_t)v;
   }
   *r = out[0]; *g = out[1]; *b = out[2];

@@ -172,7 +172,7 @@ bool     autoCrOnLf       = true;   // LF (0x0A) tambien vuelve al margen izquie
 // Si al imprimir el papel no avanza (todo se solapa en la misma linea), prueba a
 // poner autoLfOnCr en true; si en cambio el texto no vuelve al margen izquierdo entre lineas, prueba autoCrOnLf.
 #define IPP_URL_MAX_LEN 200 
-char ippUrl[IPP_URL_MAX_LEN + 1] = ""; // URL de la impresora IPP (la usa el boton Print de /list, ver ippPrintPdf() en wifi_web.ino).
+char ippUrl[IPP_URL_MAX_LEN + 1] = ""; // Direccion de la impresora del boton Print de /list: socket://IP[:puerto] (9100 por defecto), PWG raster por socket crudo; ver printPageRaster() en wifi_web.ino.
 bool     autoIPPPrint     = false;     // (para uso futuro) habilita la impresion via IPP de la pagina finalizada.
 
 
