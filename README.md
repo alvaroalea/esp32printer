@@ -32,9 +32,9 @@ the RGB led of the board indicate the state of the printer:
 
 ## Future works:
 General TODO
-* Configurable settings via web.
 * Generate a PDF of each file.
 * Send the page (PDF) to a IPP printer automatically.
+* made Configurable settings via web without restart wifi.
 
 Printer Emulation
 * Proporcional font.

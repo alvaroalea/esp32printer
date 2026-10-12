@@ -103,13 +103,16 @@
 
 #include <SPI.h>
 #include <SD.h>
+#include <Preferences.h> // memoria flash (NVS) del ESP32: guarda la configuracion de la impresora entre reinicios
 #include <Adafruit_NeoPixel.h> // Libreria "Adafruit NeoPixel" (instalar desde el Gestor de Librerias si falta)
 #include <freertos/FreeRTOS.h> // mutex de la SD (sdMutex) -- incluidas en el nucleo ESP32 de Arduino
 #include <freertos/semphr.h>
+#include <WiFi.h>
+#include <WiFiManager.h>   // libreria de terceros: "WiFiManager" de tzapu, se incluye aqui para evitar errores de compilacion.
 #include "font5x7.h"
-#include "font8x8.h"
 #include "paleta_ryb.h" // paleta de 256 colores RYBK para varias pasadas (ver su cabecera)
 #ifndef IADEVEL
+#include "font8x8.h"
 #include "roman.h"
 #include "courier.h"
 #include "prestige.h"
@@ -120,24 +123,58 @@
 
 // ================================ CONFIGURACION ===========================
 
-// --- Tarjeta SD (SPI) --- (pines para ESP32-S3; el S3 no tiene un mapeo
-// VSPI/HSPI fijo como el ESP32 clasico, asi que hay que indicarlos a mano)
+// -------------------------------- HARDWARE --------------------------------
+
+// --- Tarjeta SD (SPI) --- (pines para ESP32-S3, es obligatorio definirlos explicitamente)
 #define SD_CS_PIN     10     // Chip Select de la SD
 #define SD_MOSI_PIN   11
 #define SD_SCK_PIN    12
 #define SD_MISO_PIN   13
-#define SD_SPI_FREQ_HZ 24000000UL // 24MHz: bastante mas rapido que el por defecto
-                                   // (4MHz). Si da errores de lectura/escritura
-                                   // (cableado largo o mala calidad), bajalo.
+#define SD_SPI_FREQ_HZ 24000000UL // 24MHz: rapida, si diera errores de lectura escritura bajar hasta 4MHz.
 
 // --- Puerto serie hacia el MAX232 (Serial2 = UART2 del ESP32) ---
 #define SERIAL_TX_PIN 17
 #define SERIAL_RX_PIN 18
 #define SERIAL_RTS_PIN 15   // RTS de salida: avisa al host cuando NO debe seguir enviando
 #define SERIAL_CTS_PIN 16   // CTS de entrada: el host nos dice cuando puede recibir (no usado al imprimir)
-#define SERIAL_BAUD   9600   // Velocidad del puerto serie de la impresora
-#define USE_HW_FLOW_CONTROL true  // Control de flujo por hardware RTS/CTS (preferido: hay pines cableados)
-#define USE_XONXOFF   false  // Control de flujo por software (alternativa si no se cablean RTS/CTS)
+
+// --- Boton de cierre manual de pagina ---
+#define BUTTON_PIN         46 //tiene un pull-up externo y esta normalmente HIGH, al pulsar se lleva a GND (LOW).
+#define BUTTON_DEBOUNCE_MS 50
+
+// --- LED RGB de estado ---
+// LED direccionable (tipo WS2812/NeoPixel, un solo pin de datos) en la patilla 47.ç
+#define RGB_LED_PIN        48
+
+// -------------------------------- SOFTWARE --------------------------------
+
+// --- LED RGB de estado ---
+// Colores:
+//   verde = standby, sin pagina empezada.
+//   azul = pagina empezada (en espera), 
+//   morado = recibiendo datos por el puerto serie,
+//   amarillo = destello breve al pulsar el boton de cierre (Form Feed manual). 
+//   rojo = problema con la tarjeta SD.
+#define RGB_LED_BRIGHTNESS 0.15f  // 15% en los 3 colores
+#define RECEIVING_HOLD_MS  150UL  // cuanto se mantiene "morado" tras el ultimo byte recibido
+#define BUTTON_FLASH_MS    400UL  // duracion del destello amarillo al pulsar el boton
+#define SD_RETRY_INTERVAL_MS 5000UL // cada cuanto se reintenta remontar la SD si fallo
+
+// --- CONFIGURACION EDITABLE (Equivalente por software a los DIP-switch).
+// Los valores de aqui son los INICIALES (los de fabrica); al arrancar loadConfig() 
+// los sustituye por lo guardado en la memoria flash (Preferences)
+// y la pagina de configuracion del WiFi los cambia y los guarda (ver wifi_web.ino).
+uint32_t serialBaud       = 9600;  // Velocidad del puerto serie de la impresora
+bool     useHwFlowControl = true;  // Control de flujo por hardware RTS/CTS (preferido: hay pines cableados)
+bool     useXonXoff       = false; // Control de flujo por software (alternativa si no se cablean RTS/CTS)
+bool     autoLfOnCr       = false;  // CR (0x0D) tambien hace un salto de linea
+bool     autoCrOnLf       = true;   // LF (0x0A) tambien vuelve al margen izquierdo
+// Si al imprimir el papel no avanza (todo se solapa en la misma linea), prueba a
+// poner autoLfOnCr en true; si en cambio el texto no vuelve al margen izquierdo entre lineas, prueba autoCrOnLf.
+#define IPP_URL_MAX_LEN 200 
+char ippUrl[IPP_URL_MAX_LEN + 1] = ""; // (para uso futuro) URL de la impresora IPP.
+bool     autoIPPPrint     = false;     // (para uso futuro) habilita la impresion via IPP de la pagina finalizada.
+
 
 // --- Geometria de la pagina virtual (rejilla interna a 180 dpi) ---
 #define PAGE_WIDTH_DOTS   1440   // 1440/180 = 8.0 pulgadas de ancho de impresion
@@ -168,52 +205,39 @@
 #define BAND_BYTES        ((size_t)BAND_HEIGHT * PAGE_WIDTH_DOTS)
 #define DEFAULT_LINE_DOTS 30     // 1/6" a 180dpi = 30 puntos (interlineado por defecto)
 
-// Equivalente por software a los DIP-switch "Auto LF" / "Auto CR" de una
-// Epson real. Muchos ordenadores antiguos solo mandan CR (0x0D) al final de
-// linea y esperan que la propia impresora añada el salto de linea (o al
-// reves: solo mandan LF esperando que la impresora vuelva al margen). Si al
-// imprimir el papel no avanza (todo se solapa en la misma linea), prueba a
-// poner AUTO_LF_ON_CR en true; si en cambio el texto no vuelve al margen
-// izquierdo entre lineas, prueba AUTO_CR_ON_LF.
-#define AUTO_LF_ON_CR  false  // CR (0x0D) tambien hace un salto de linea
-#define AUTO_CR_ON_LF  true   // LF (0x0A) tambien vuelve al margen izquierdo
-#define IDLE_TIMEOUT_MS   600000UL  // 10 minutos. millis() es un unsigned long de 32 bits
+
+volatile bool serialConfigDirty = false; // la pagina WiFi (otro nucleo) pide re-aplicar baudios/flujo; lo hace loop()
+#define IDLE_TIMEOUT_MS   600000UL  // 10 minutos. 
 #define LINE_BUFFER_CHARS 512       // caracteres que caben en el buffer de linea (>=256; 12 bytes cada uno = 6KB). Si se llena, se dibuja lo acumulado y se sigue.
 #define LINE_IDLE_FLUSH_MS 3000UL   // si el host se calla este tiempo con texto sin terminar (sin LF/CR/FF), se dibuja igualmente
 #define DEL_CLEARS_WHOLE_LINE false // DEL (0x7F): false = borra solo el ULTIMO caracter del buffer (ESC/P real); true = borra todo el buffer como CAN
 #define ESC_2_SELECTS_PROGRAMMED_SPACING false // ESC 2: false = siempre 1/6" (texto de la referencia Epson ESC/P2); true = aplica el ultimo valor de ESC A (convencion IBM/FX, donde ESC A solo programaba)
 #define ESC_R_RESETS_TABS  true     // ESC R sin parametro = restaurar tabuladores de fabrica (modo IBM/Epson). false = ESC R n (juego internacional de caracteres, n se descarta)
 #define MAX_HTABS          32       // tabuladores horizontales maximos de ESC D
-                                     // (desborda a los ~49.7 dias), asi que 10 minutos caben
-                                     // de sobra sin ningun problema; no hace falta recortarlo.
 
-// --- Boton de cierre manual de pagina ---
-// Boton con pull-up EXTERNO a la patilla 46 (no se usa INPUT_PULLUP porque
-// hay resistencia externa): en reposo la patilla esta en HIGH y al pulsar
-// el boton la lleva a GND (LOW).
-#define BUTTON_PIN         46
-#define BUTTON_DEBOUNCE_MS 50
 
-// --- LED RGB de estado ---
-// LED direccionable (tipo WS2812/NeoPixel, un solo pin de datos) en la
-// patilla 47. Colores: verde = sin pagina empezada, azul = pagina
-// empezada (en espera), morado = recibiendo datos por el puerto serie,
-// amarillo = destello breve al pulsar el boton de cierre (Form Feed
-// manual), rojo = problema con la tarjeta SD.
-#define RGB_LED_PIN        48
-#define RGB_LED_BRIGHTNESS 0.15f  // 15% en los 3 colores
-#define RECEIVING_HOLD_MS  150UL  // cuanto se mantiene "morado" tras el ultimo byte recibido
-#define BUTTON_FLASH_MS    400UL  // duracion del destello amarillo al pulsar el boton
-#define SD_RETRY_INTERVAL_MS 5000UL // cada cuanto se reintenta remontar la SD si fallo
+// A continuacion algunas declaraciones de funciones y estructuras adelantadas, 
+// que hay que definir al aqui (y no junto a chooseFont()/drawChar() mas abajo) porque el
+// IDE de Arduino genera automaticamente los prototipos de las funciones al principio de compilacion
+// y si no se indican explicitamente la compilacion fallaria.
+
+void sdWriteBegin();  //para sincronizar las funcines de escritura a la SD y el led.
+void sdWriteEnd();
+void sdAccessBegin();
+void sdAccessEnd();
+void updateStatusLed();
+
+void startWifiWebTask(); // ya definidas en wifi_web.ino (otra pestana del MISMO sketch),
+static void addPrinterParams(WiFiManager &wm); // pero aqui evita el error de compilacion.
+// WiFi con portal de configuracion, OTA y servidor web.
+// Corren en su PROPIA tarea de FreeRTOS (ver startWifiWebTask()) para que
+// el autoConnect() bloqueante de WiFiManager no retrase el arranque de la
+// emulacion de impresora ni un segundo.
+
 
 // ================================ PALETA DE COLOR ==========================
 // Colores: ver paleta_ryb.h (cinta Rojo/Amarillo/Azul/Negro, varias pasadas, 256 colores).
 
-// Declarado aqui (y no junto a chooseFont()/drawChar() mas abajo) porque el
-// IDE de Arduino genera automaticamente los prototipos de las funciones y
-// los inserta al principio del fichero: si el struct se definiera despues,
-// esos prototipos no lo conocerian todavia y la compilacion fallaria con
-// "'FontChoice' does not name a type".
 struct FontChoice { const uint8_t *data; uint8_t cols; uint8_t rows; uint8_t firstChar; uint8_t lastChar; uint8_t baseScaleY; };
 struct GfxMode { uint8_t pins; uint16_t dpi; }; // ver el comentario de FontChoice: debe ir aqui, antes de cualquier funcion
 // Un caracter pendiente de dibujar en el buffer de linea, con todos los atributos que tenia al llegar:
@@ -230,21 +254,7 @@ struct LineChar {
   uint8_t sp;       // ESC SP n vigente (separacion extra entre caracteres)
 };
 
-// Declaraciones adelantadas: el codigo de escritura en SD (mas abajo) necesita
-// avisar al LED en el momento exacto en que empieza/termina a escribir, pero
-// las funciones del LED estan definidas mas adelante en el fichero.
-void sdWriteBegin();
-void sdWriteEnd();
-void sdAccessBegin();
-void sdAccessEnd();
-void updateStatusLed();
 
-// Definidas en wifi_web.ino (otra pestana del MISMO sketch, debe estar en
-// la misma carpeta): WiFi con portal de configuracion, OTA y servidor web.
-// Corren en su PROPIA tarea de FreeRTOS (ver startWifiWebTask()) para que
-// el autoConnect() bloqueante de WiFiManager no retrase el arranque de la
-// emulacion de impresora ni un segundo.
-void startWifiWebTask();
 #define COLOR_WHITE_INDEX RYBK_WHITE_INDEX // "sin tinta" = papel blanco = indice 0 de la paleta RYBK: el indice de
                                            // band[] es directamente el indice de paleta que se guarda en el fichero
 
@@ -716,7 +726,7 @@ void openNewPage() {
 void closePage() {
   if (!pageOpen) return;
 
-  if (USE_XONXOFF) Serial2.write((uint8_t)0x13); // XOFF: puede tardar en escribir en SD
+  if (useXonXoff) Serial2.write((uint8_t)0x13); // XOFF: puede tardar en escribir en SD
 
   if (pageFileCreated) {
     sdWriteBegin();
@@ -731,7 +741,7 @@ void closePage() {
   pageOpen = false;
   pageFileCreated = false;
 
-  if (USE_XONXOFF) Serial2.write((uint8_t)0x11); // XON
+  if (useXonXoff) Serial2.write((uint8_t)0x11); // XON
 }
 
 void flushLineBuffer(); // declaracion adelantada (definida tras drawChar)
@@ -1223,11 +1233,11 @@ void runParenCommand() {
   Serial.printf("[DEBUG] Comando ESC ( %c (%u bytes de datos) no soportado: se descarta\n", (char)parenCmd, (unsigned)n);
 }
 
-// LF: vuelca el texto pendiente de la linea, avanza y (AUTO_CR_ON_LF) vuelve al margen izquierdo.
+// LF: vuelca el texto pendiente de la linea, avanza y (autoCrOnLf) vuelve al margen izquierdo.
 void lineFeedAction() {
   flushLineBuffer();
   doLineFeed();
-  if (AUTO_CR_ON_LF) cursorX = leftMarginDots;
+  if (autoCrOnLf) cursorX = leftMarginDots;
 }
 
 // HT: siguiente tabulador a la derecha de cursorX. Si no hay ninguno antes del
@@ -1267,14 +1277,14 @@ void handleByteInner(uint8_t b) {
         case 0x0D: // CR: dibuja la linea pendiente y vuelve al margen izquierdo (sin avanzar papel: permite sobreimprimir)
           flushLineBuffer();
           cursorX = leftMarginDots;
-          if (AUTO_LF_ON_CR) doLineFeed();
+          if (autoLfOnCr) doLineFeed();
           return;
         case 0x0B: // VT: tabulador vertical (ESC e 1 n); sin tabuladores definidos actua como LF
           if (vTabIncU > 0) {
             flushLineBuffer();
             setCursorYUnits(((cursorYUnits() / vTabIncU) + 1) * vTabIncU);
             lineCellHeight = 0; lineMinAdvance = 0;
-            if (AUTO_CR_ON_LF) cursorX = leftMarginDots;
+            if (autoCrOnLf) cursorX = leftMarginDots;
           } else {
             lineFeedAction();
           }
@@ -1310,7 +1320,7 @@ void handleByteInner(uint8_t b) {
           if (b >= 0x20 && b <= 0x7E) {
             uint16_t adv = computeAdvanceDots();
             // Salto automatico: si el caracter no cabe antes del margen derecho,
-            // la impresora hace CR+LF (independiente de AUTO_CR_ON_LF, que es
+            // la impresora hace CR+LF (independiente de autoCrOnLf, que es
             // para el LF que manda el host) y lo imprime en la linea siguiente.
             // Solo se envuelve una vez: si no cupiera ni vacia la linea, se dibuja
             // igualmente (recortado) en vez de entrar en bucle.
@@ -1723,10 +1733,112 @@ void updateStatusLed() {
 
 // ================================ ARDUINO SETUP / LOOP ======================
 
+// ================================ CONFIGURACION PERSISTENTE ================
+//
+// Los ajustes editables (serialBaud, useHwFlowControl, useXonXoff, autoLfOnCr, autoCrOnLf, ippUrl, autoIPPPrint)
+// viven en variables globales y se guardan en la memoria flash del ESP32 con la libreria
+// Preferences (zona NVS, espacio de nombres "printer"). Al arrancar, loadConfig() lee lo guardado;
+// lo que no este guardado aun conserva su valor inicial (el de la declaracion de arriba).
+
+#define CONFIG_NAMESPACE "printer"
+#define CONFIG_KEY_COUNT 7
+static bool cfgFromFlash[CONFIG_KEY_COUNT]; // 0 baud, 1 hwflow, 2 xonxoff, 3 autolf, 4 autocr, 5 ippurl, 6 autoprint: viene de la flash
+
+bool validBaud(uint32_t b) { return b >= 300 && b <= 1000000; }
+
+void loadConfig() {
+  for (int i = 0; i < CONFIG_KEY_COUNT; i++) cfgFromFlash[i] = false;
+  Preferences prefs;
+  // Solo lectura: falla si el espacio de nombres todavia no existe (primer arranque, o flash borrada);
+  // en ese caso se queda todo con los valores iniciales.
+  if (!prefs.begin(CONFIG_NAMESPACE, true)) return;
+  if (prefs.isKey("baud")) {
+    uint32_t b = prefs.getUInt("baud", serialBaud);
+    if (validBaud(b)) { serialBaud = b; cfgFromFlash[0] = true; }
+    else Serial.printf("[CONFIG] Baudios guardados no validos (%lu): se usa el valor inicial %lu\n", (unsigned long)b, (unsigned long)serialBaud);
+  }
+  if (prefs.isKey("hwflow"))  { useHwFlowControl = prefs.getBool("hwflow",  useHwFlowControl); cfgFromFlash[1] = true; }
+  if (prefs.isKey("xonxoff")) { useXonXoff       = prefs.getBool("xonxoff", useXonXoff);       cfgFromFlash[2] = true; }
+  if (prefs.isKey("autolf"))  { autoLfOnCr       = prefs.getBool("autolf",  autoLfOnCr);       cfgFromFlash[3] = true; }
+  if (prefs.isKey("autocr"))  { autoCrOnLf       = prefs.getBool("autocr",  autoCrOnLf);       cfgFromFlash[4] = true; }
+  if (prefs.isKey("ippurl"))  {
+    prefs.getString("ippurl", ippUrl, sizeof(ippUrl)); // copia como mucho IPP_URL_MAX_LEN caracteres + el cero final
+    ippUrl[IPP_URL_MAX_LEN] = 0;
+    cfgFromFlash[5] = true;
+  }
+  if (prefs.isKey("autoprint"))  { autoIPPPrint  = prefs.getBool("autoprint",  autoIPPPrint);  cfgFromFlash[5] = true; }
+  prefs.end();
+}
+
+// Guarda TODOS los ajustes en la flash. Devuelve false si no se pudo abrir la NVS.
+bool saveConfig() {
+  Preferences prefs;
+  if (!prefs.begin(CONFIG_NAMESPACE, false)) {
+    Serial.println("[CONFIG] ERROR: no se pudo abrir la memoria flash para guardar la configuracion.");
+    return false;
+  }
+  prefs.putUInt("baud", serialBaud);
+  prefs.putBool("hwflow",  useHwFlowControl);
+  prefs.putBool("xonxoff", useXonXoff);
+  prefs.putBool("autolf",  autoLfOnCr);
+  prefs.putBool("autocr",  autoCrOnLf);
+  prefs.putString("ippurl", ippUrl);
+  prefs.putBool("autoprint",  autoIPPPrint);
+  prefs.end();
+  for (int i = 0; i < CONFIG_KEY_COUNT; i++) cfgFromFlash[i] = true;
+  return true;
+}
+
+// Vuelca la configuracion vigente al puerto serie de depuracion. "(valor inicial)" marca lo que
+// aun no se ha guardado nunca en la flash.
+void printConfig(const char *title) {
+  const char *init = "   (valor inicial, no guardado)";
+  Serial.printf("[CONFIG] %s\n", title);
+  Serial.printf("[CONFIG]   serialBaud       = %lu%s\n", (unsigned long)serialBaud, cfgFromFlash[0] ? "" : init);
+  Serial.printf("[CONFIG]   useHwFlowControl = %s%s\n", useHwFlowControl ? "true" : "false", cfgFromFlash[1] ? "" : init);
+  Serial.printf("[CONFIG]   useXonXoff       = %s%s\n", useXonXoff ? "true" : "false", cfgFromFlash[2] ? "" : init);
+  Serial.printf("[CONFIG]   autoLfOnCr       = %s%s\n", autoLfOnCr ? "true" : "false", cfgFromFlash[3] ? "" : init);
+  Serial.printf("[CONFIG]   autoCrOnLf       = %s%s\n", autoCrOnLf ? "true" : "false", cfgFromFlash[4] ? "" : init);
+  Serial.printf("[CONFIG]   ippUrl           = %s%s\n", ippUrl[0] ? ippUrl : "(vacia)", cfgFromFlash[5] ? "" : init);
+  Serial.printf("[CONFIG]   autoIPPPrint     = %s%s\n", autoIPPPrint ? "true" : "false", cfgFromFlash[6] ? "" : init);
+}
+
+// (Re)configura Serial2 con serialBaud / useHwFlowControl. Con reinit=true primero lo cierra: es lo
+// que hace loop() cuando la pagina WiFi cambia los baudios o el control de flujo (solo el nucleo que
+// usa Serial2 debe tocarlo, por eso lo pide con serialConfigDirty en vez de hacerlo el otro nucleo).
+void applySerialConfig(bool reinit) {
+  if (reinit) Serial2.end();
+  Serial2.setRxBufferSize(2048); // margen extra frente a rafagas mientras se escribe en la SD
+  if (useHwFlowControl) {
+    // OJO: esto NO es lo que fija RX/TX -- eso lo hace siempre Serial2.begin()
+    // un poco mas abajo (recibe RX/TX como parametros y los configura tanto
+    // si hay control de flujo como si no). setPins() aqui sirve UNICAMENTE
+    // para añadir los pines CTS/RTS antes de begin(), que es el unico sitio
+    // donde se pueden indicar (el begin() de 5 parametros que usamos no
+    // acepta CTS/RTS directamente). Por eso esta en un if: si no se usa
+    // control de flujo por hardware, simplemente no se tocan esos dos pines
+    // y el puerto serie funciona igual de bien solo con RX/TX.
+    Serial2.setPins(SERIAL_RX_PIN, SERIAL_TX_PIN, SERIAL_CTS_PIN, SERIAL_RTS_PIN);
+  }
+  Serial2.begin(serialBaud, SERIAL_8N1, SERIAL_RX_PIN, SERIAL_TX_PIN);
+  if (useHwFlowControl) {
+    // El propio driver de UART baja RTS automaticamente cuando el buffer de
+    // recepcion se llena por encima del umbral, y lo sube cuando hay hueco:
+    // asi el host deja de enviar mientras escribimos en la SD, sin que
+    // nuestro codigo tenga que gestionarlo a mano (a diferencia del XON/XOFF).
+    Serial2.setHwFlowCtrlMode(UART_HW_FLOWCTRL_CTS_RTS, 64);
+  }
+  Serial.printf("[CONFIG] Puerto serie de la impresora: %lu baudios, 8N1, control de flujo %s%s%s\n",
+                (unsigned long)serialBaud, useHwFlowControl ? "hardware RTS/CTS" : "sin hardware",
+                useXonXoff ? " + XON/XOFF" : "", reinit ? " (reconfigurado)" : "");
+}
+
 void setup() {
   Serial.begin(115200);
   delay(200);
   Serial.println("\n[INFO] Emulador de impresora Epson LQ 24 agujas color - iniciando...");
+  loadConfig();
+  printConfig("Configuracion cargada de la memoria flash:");
 
   sdMutex = xSemaphoreCreateMutex(); // antes de cualquier acceso a la SD
 
@@ -1765,26 +1877,7 @@ void setup() {
   }
   updateStatusLed(); // reflejar el resultado del montaje de inmediato
 
-  Serial2.setRxBufferSize(2048); // margen extra frente a rafagas mientras se escribe en la SD
-  if (USE_HW_FLOW_CONTROL) {
-    // OJO: esto NO es lo que fija RX/TX -- eso lo hace siempre Serial2.begin()
-    // un poco mas abajo (recibe RX/TX como parametros y los configura tanto
-    // si hay control de flujo como si no). setPins() aqui sirve UNICAMENTE
-    // para añadir los pines CTS/RTS antes de begin(), que es el unico sitio
-    // donde se pueden indicar (el begin() de 5 parametros que usamos no
-    // acepta CTS/RTS directamente). Por eso esta en un if: si no se usa
-    // control de flujo por hardware, simplemente no se tocan esos dos pines
-    // y el puerto serie funciona igual de bien solo con RX/TX.
-    Serial2.setPins(SERIAL_RX_PIN, SERIAL_TX_PIN, SERIAL_CTS_PIN, SERIAL_RTS_PIN);
-  }
-  Serial2.begin(SERIAL_BAUD, SERIAL_8N1, SERIAL_RX_PIN, SERIAL_TX_PIN);
-  if (USE_HW_FLOW_CONTROL) {
-    // El propio driver de UART baja RTS automaticamente cuando el buffer de
-    // recepcion se llena por encima del umbral, y lo sube cuando hay hueco:
-    // asi el host deja de enviar mientras escribimos en la SD, sin que
-    // nuestro codigo tenga que gestionarlo a mano (a diferencia del XON/XOFF).
-    Serial2.setHwFlowCtrlMode(UART_HW_FLOWCTRL_CTS_RTS, 64);
-  }
+  applySerialConfig(false); // Serial2 con la configuracion cargada (baudios, control de flujo)
 
   allocBand(); // antes de tocar band[]
   memset(band, COLOR_WHITE_INDEX, BAND_BYTES);
@@ -1812,8 +1905,14 @@ void loop() {
 
   checkCloseButton();
 
+  // La pagina de configuracion del WiFi (nucleo 0) cambio los baudios o el control de flujo: se
+  // re-aplican aqui, en el nucleo que usa Serial2. Durante ese instante pueden perderse bytes.
+  if (serialConfigDirty) {
+    serialConfigDirty = false;
+    applySerialConfig(true);
+  }
+
   // Si la SD fallo (al arrancar o al abrir un fichero), reintentar montarla
-  // de vez en cuando en vez de quedarse en rojo para siempre.
   if (!sdOk && (millis() - lastSdRetryMillis > SD_RETRY_INTERVAL_MS)) {
     lastSdRetryMillis = millis();
     Serial.println("[INFO] Reintentando montar la tarjeta SD...");
@@ -1834,8 +1933,7 @@ void loop() {
     flushLineBuffer();
   }
 
-  // Si llevamos un rato sin recibir nada y hay una pagina con contenido sin
-  // cerrar (el host no envio Form Feed final), la cerramos igualmente.
+  // Tras un tiempo sin recibir nada y si el host no envio Form Feed final, la cerramos igualmente.
   if (pageOpen && pageHasInk && (millis() - lastByteMillis > IDLE_TIMEOUT_MS)) {
     Serial.println("[INFO] Sin actividad: cerrando pagina automaticamente.");
     finishPageIfNeeded();
