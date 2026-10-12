@@ -32,8 +32,7 @@ the RGB led of the board indicate the state of the printer:
 
 ## Future works:
 General TODO
-* Generate a PDF of each file.
-* Send the page (PDF) to a IPP printer automatically.
+* Send the page (PDF) to a IPP printer automatically if configured for that.
 * made Configurable settings via web without restart wifi.
 
 Printer Emulation

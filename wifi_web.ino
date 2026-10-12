@@ -46,7 +46,9 @@
  *                      (la misma del primer arranque) sin borrar la red
  *                      guardada: sirve para cambiar los ajustes de la impresora
  *       /list          lista de todos los PAGEnnnn.BMP que hay en la SD, cada
- *                      uno con un boton para borrarlo (POST /delete)
+ *                      uno con un boton [pdf] (si existe su PAGEnnnn.PDF) y
+ *                      un boton para borrarlo (POST /delete, que borra el BMP
+ *                      y su PDF)
  *       /wifi-reset    borra la red WiFi guardada y reinicia (para volver
  *                      a configurar otra red)
  *
@@ -146,9 +148,9 @@ void handleRoot() {
 // pocos milisegundos), nunca mientras se manda el trozo por WiFi (que con
 // una red lenta puede tardar bastante) -- asi el bucle principal, que
 // imprime, nunca espera mas de lo que tarda una lectura suelta de la SD.
-void sendFileChunked(File &f, uint32_t totalSize) {
+void sendFileChunked(File &f, uint32_t totalSize, const char *contentType) {
   webServer.setContentLength(totalSize);
-  webServer.send(200, "image/bmp", "");
+  webServer.send(200, contentType, "");
   WiFiClient client = webServer.client();
   client.setNoDelay(true); // manda cada trozo ya, sin esperar a llenar el paquete TCP
 
@@ -178,7 +180,9 @@ void streamBmpFile(const char *path) {
     webServer.send(404, "text/plain", "No hay ninguna pagina generada todavia.");
     return;
   }
-  sendFileChunked(f, size);
+  String p = path;
+  p.toUpperCase();
+  sendFileChunked(f, size, p.endsWith(".PDF") ? "application/pdf" : "image/bmp"); // tambien sirve los .PDF de las hojas
   sdAccessBegin();
   f.close();
   sdAccessEnd();
@@ -264,7 +268,9 @@ bool isPageFileName(const String &n) {
 void handleList() {
   String html = "<!DOCTYPE html><html><head><meta charset='utf-8'><title>Paginas</title>"
                  "<style>body{font-family:sans-serif}"
-                 ".del{font-size:.7em;padding:0 .4em;margin-left:.4em;color:#b00;cursor:pointer}</style></head><body>"
+                 ".del{font-size:.7em;padding:0 .4em;margin-left:.4em;color:#b00;cursor:pointer}"
+                 "a.pdf{font-size:.7em;padding:0 .4em;margin-left:.4em;border:1px solid #767676;border-radius:3px;"
+                 "background:#efefef;color:#000;text-decoration:none}</style></head><body>"
                  "<h2>Paginas en la SD</h2><ul>";
   sdAccessBegin(); // listado breve: un unico bloqueo para toda la funcion
   File root = SD.open("/");
@@ -281,8 +287,12 @@ void handleList() {
         html += "<li><a href='" + href + "'>" + name + "</a> (" +
                 String(entry.size()) + " bytes)";
         if (pageOpen && pageFileCreated && href == String(currentFileName)) {
-          html += " <small>(imprimiendose ahora)</small>"; // la hoja en curso no se puede borrar
+          html += " <small>(imprimiendose ahora)</small>"; // la hoja en curso no se puede borrar (y su PDF aun no existe)
         } else if (isPageFileName(bare)) {
+          // [pdf]: descarga del PDF de la hoja (PAGEnnnn.PDF), solo si existe. Los PDF no se listan aparte.
+          String pdfName = bare.substring(0, 8) + ".PDF";
+          if (SD.exists(("/" + pdfName).c_str()))
+            html += " <a class='pdf' href='/" + pdfName + "' download='" + pdfName + "' title='Descargar el PDF de la hoja'>[pdf]</a>";
           // POST (no un enlace GET: un enlace podria borrarse al precargarlo el navegador o al
           // seguirlo un rastreador) + confirmacion en el navegador antes de enviar.
           html += " <form method='POST' action='/delete' style='display:inline' "
@@ -301,7 +311,7 @@ void handleList() {
   webServer.send(200, "text/html", html);
 }
 
-// --- /delete (solo POST): borra de la SD una hoja PAGEnnnn.BMP y vuelve al listado ---
+// --- /delete (solo POST): borra de la SD una hoja PAGEnnnn.BMP y su PAGEnnnn.PDF (si existe) y vuelve al listado ---
 void handleDelete() {
   String f = webServer.arg("f");
   if (!isPageFileName(f)) {
@@ -309,34 +319,42 @@ void handleDelete() {
     return;
   }
   String path = "/" + f;
+  String pdfPath = "/" + f.substring(0, 8) + ".PDF"; // el PDF de la hoja: mismo nombre, extension .PDF
   int result = 0; // 0 = borrada, 1 = no existe, 2 = se esta imprimiendo, 3 = fallo al borrar
   sdAccessBegin(); // la comprobacion de "hoja en curso" va DENTRO del bloqueo: asi no puede cambiar mientras se borra
   if (pageOpen && pageFileCreated && path == String(currentFileName)) result = 2;
-  else if (!SD.exists(path.c_str())) result = 1;
-  else if (!SD.remove(path.c_str())) result = 3;
+  else {
+    bool hasBmp = SD.exists(path.c_str()), hasPdf = SD.exists(pdfPath.c_str());
+    if (!hasBmp && !hasPdf) result = 1;
+    else {
+      // se intentan borrar los dos aunque falle el primero; cualquier fallo -> 500
+      if (hasBmp && !SD.remove(path.c_str())) result = 3;
+      if (hasPdf && !SD.remove(pdfPath.c_str())) result = 3;
+    }
+  }
   sdAccessEnd();
   if (result == 2) {
     webServer.send(409, "text/plain", "Esa pagina se esta imprimiendo ahora mismo: no se puede borrar hasta que se cierre.");
     return;
   }
   if (result == 3) {
-    webServer.send(500, "text/plain", "No se pudo borrar " + f + " de la SD.");
+    webServer.send(500, "text/plain", "No se pudo borrar " + f + " (o su PDF) de la SD.");
     return;
   }
-  if (result == 0) Serial.printf("[INFO] Pagina borrada desde la web: %s\n", path.c_str());
+  if (result == 0) Serial.printf("[INFO] Pagina borrada desde la web: %s (y su PDF, si existia)\n", path.c_str());
   // 303 + Location: el navegador recarga /list con un GET, asi que F5 no repite el borrado.
   webServer.sendHeader("Location", "/list");
   webServer.send(303, "text/plain", "");
 }
 
-// --- Sirve cualquier .BMP que exista en la SD por su nombre de fichero
-// (ej. /PAGE0007.BMP), que es a donde apuntan los enlaces de /list. Se
+// --- Sirve cualquier .BMP o .PDF que exista en la SD por su nombre de fichero
+// (ej. /PAGE0007.BMP o /PAGE0007.PDF), que es a donde apuntan los enlaces de /list. Se
 // registra con onNotFound() porque esos nombres no se conocen de antemano
 // (se van creando segun se imprime), asi que no se puede dar de alta una
 // ruta fija por cada uno con webServer.on() ---
 void handlePossibleBmpFile() {
   String uri = webServer.uri(); // p.ej. "/PAGE0007.BMP"
-  if (uri.endsWith(".BMP") || uri.endsWith(".bmp")) {
+  if (uri.endsWith(".BMP") || uri.endsWith(".bmp") || uri.endsWith(".PDF") || uri.endsWith(".pdf")) {
     sdAccessBegin();
     bool exists = SD.exists(uri.c_str());
     sdAccessEnd();
@@ -551,7 +569,7 @@ void setupWifiOtaWeb() {
   webServer.on("/delete", HTTP_POST, handleDelete); // solo POST: un GET a /delete cae en onNotFound (404), nunca borra
   webServer.on("/config", handleConfigPortal);
   webServer.on("/wifi-reset", handleWifiReset);
-  webServer.onNotFound(handlePossibleBmpFile); // sirve /PAGEnnnn.BMP (enlaces de /list)
+  webServer.onNotFound(handlePossibleBmpFile); // sirve /PAGEnnnn.BMP y .PDF (enlaces de /list)
   webServer.begin();
   Serial.println("[WEB] Servidor web escuchando en el puerto 80.");
 }

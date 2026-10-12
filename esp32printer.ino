@@ -703,6 +703,140 @@ void plotDot(int32_t x, int32_t y, uint8_t colorIndex) {
   if (y > maxYUsed) maxYUsed = y;
 }
 
+// ================================ PDF DE CADA HOJA ==========================
+//
+// Al cerrar una hoja (FF, boton, fin de hoja, timeout) se crea ademas junto al BMP un PDF con el
+// mismo nombre y extension .PDF (/PAGE0007.BMP -> /PAGE0007.PDF) que muestra el bitmap centrado
+// en una hoja A4 con margenes laterales de PDF_SIDE_MARGIN_MM. Pensado para mandarlo luego tal
+// cual a una impresora por IPP, y para ser lo mas barato posible de generar:
+//  - SIN compresion: la imagen es un XObject de 8 bits con espacio de color /Indexed /DeviceRGB
+//    (la paleta de 256 colores de paleta_ryb.h, en hexadecimal dentro del propio PDF) y SIN /Filter.
+//    Los datos del stream son EXACTAMENTE los pixeles del BMP: el BMP es de arriba a abajo (alto
+//    negativo), 1 byte por pixel y fila = PAGE_WIDTH_DOTS bytes (multiplo de 4, sin relleno), que
+//    es justo el orden y el formato que espera PDF. Es una copia de bytes, sin convertir nada.
+//  - Estructura minima: 5 objetos (catalogo, paginas, pagina, contenido, imagen). Como el tamano
+//    del stream se conoce de antemano, la cabecera (objetos 1..5 hasta "stream") se escribe de una
+//    vez, luego los pixeles y al final un pie con "endstream", la tabla xref y el trailer. Sin
+//    seeks ni parcheos posteriores: escritura 100% secuencial.
+//  - Los pixeles se copian de la cache PSRAM (si cubre la hoja) directamente a la SD en trozos de
+//    PDF_COPY_CHUNK_BYTES, sin releer el BMP; sin cache se releen del BMP aun abierto.
+// Se llama desde closePage() con la SD bloqueada y todas las filas ya volcadas al BMP/cache. Si
+// falla, se borra el PDF a medias y el BMP no se ve afectado.
+#define PDF_PAGE_WIDTH_MM    210.0f  // A4 vertical (para Carta: 215.9 x 279.4)
+#define PDF_PAGE_HEIGHT_MM   297.0f
+#define PDF_SIDE_MARGIN_MM     5.0f  // margen izquierdo y derecho; la imagen se centra tambien en vertical
+#define PDF_COPY_CHUNK_BYTES 32768   // trozo de escritura desde la cache (multiplo de 512 = sector de SD)
+
+static char pdfHeaderBuf[3072];      // objetos 1..5 hasta "stream\n" (la paleta en hexadecimal son 1536 bytes)
+
+bool writePagePdf() {
+  // --- Nombre: el del BMP con extension PDF
+  char pdfName[32];
+  strlcpy(pdfName, currentFileName, sizeof(pdfName));
+  size_t nameLen = strlen(pdfName);
+  if (nameLen < 5) return false;
+  memcpy(pdfName + nameLen - 3, "PDF", 3);
+
+  // --- Geometria en puntos PDF (1/72"): ancho = hoja - 2 margenes; alto segun la proporcion del
+  // bitmap; centrado en horizontal y en vertical. Si por alguna razon no cupiera a lo alto (otro
+  // PAGE_HEIGHT_DOTS o papel), se ajusta al alto y se centra (margenes laterales >= 5mm).
+  const float PT_PER_MM = 72.0f / 25.4f;
+  const float pageW = PDF_PAGE_WIDTH_MM * PT_PER_MM, pageH = PDF_PAGE_HEIGHT_MM * PT_PER_MM;
+  float imgW = pageW - 2.0f * PDF_SIDE_MARGIN_MM * PT_PER_MM;
+  float imgH = imgW * (float)PAGE_HEIGHT_DOTS / (float)PAGE_WIDTH_DOTS;
+  if (imgH > pageH) { imgH = pageH; imgW = imgH * (float)PAGE_WIDTH_DOTS / (float)PAGE_HEIGHT_DOTS; }
+  const float imgX = (pageW - imgW) / 2.0f, imgY = (pageH - imgH) / 2.0f; // origen PDF = abajo a la izquierda
+
+  const uint32_t rs = rowSizeBytes();                               // == PAGE_WIDTH_DOTS (static_assert)
+  const uint32_t pixBytes = rs * (uint32_t)PAGE_HEIGHT_DOTS;        // tamano del stream de la imagen
+
+  // --- Cabecera: objetos 1..5 (el 5, la imagen, queda abierto: termina en "stream\n")
+  char content[96];
+  int contentLen = snprintf(content, sizeof(content), "q %.3f 0 0 %.3f %.3f %.3f cm /Im0 Do Q\n",
+                            imgW, imgH, imgX, imgY);
+  char *h = pdfHeaderBuf;
+  const size_t cap = sizeof(pdfHeaderBuf);
+  int n = 0;
+  uint32_t objOff[6] = {0, 0, 0, 0, 0, 0};
+#define PDF_PUT(...) do { if (n >= 0 && (size_t)n < cap) { int r_ = snprintf(h + n, cap - (size_t)n, __VA_ARGS__); n = (r_ < 0) ? -1 : n + r_; } } while (0)
+  PDF_PUT("%%PDF-1.4\n%%\xE2\xE3\xCF\xD3\n"); // la linea de comentario con bytes altos marca el fichero como binario
+  objOff[1] = (uint32_t)n;
+  PDF_PUT("1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n");
+  objOff[2] = (uint32_t)n;
+  PDF_PUT("2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n");
+  objOff[3] = (uint32_t)n;
+  PDF_PUT("3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 %.3f %.3f] "
+          "/Resources << /XObject << /Im0 5 0 R >> >> /Contents 4 0 R >>\nendobj\n", pageW, pageH);
+  objOff[4] = (uint32_t)n;
+  PDF_PUT("4 0 obj\n<< /Length %d >>\nstream\n%sendstream\nendobj\n", contentLen, content);
+  objOff[5] = (uint32_t)n;
+  PDF_PUT("5 0 obj\n<< /Type /XObject /Subtype /Image /Width %d /Height %d /BitsPerComponent 8 "
+          "/ColorSpace [/Indexed /DeviceRGB 255 <", (int)PAGE_WIDTH_DOTS, (int)PAGE_HEIGHT_DOTS);
+#undef PDF_PUT
+  if (n < 0 || (size_t)n + 2 * 768 + 128 >= cap) { // sitio para la paleta en hex (1536) + el cierre del diccionario
+    Serial.println("[ERROR] PDF: la cabecera no cabe en el buffer.");
+    return false;
+  }
+  static const char hexDigits[] = "0123456789ABCDEF";
+  for (int i = 0; i < BMP_PALETTE_COLORS; i++) {
+    uint8_t r, g, b;
+    rybkColor((uint8_t)i, &r, &g, &b);
+    h[n++] = hexDigits[r >> 4]; h[n++] = hexDigits[r & 15];
+    h[n++] = hexDigits[g >> 4]; h[n++] = hexDigits[g & 15];
+    h[n++] = hexDigits[b >> 4]; h[n++] = hexDigits[b & 15];
+  }
+  int r2 = snprintf(h + n, cap - (size_t)n, ">] /Length %lu >>\nstream\n", (unsigned long)pixBytes);
+  if (r2 < 0 || (size_t)(n + r2) >= cap) { Serial.println("[ERROR] PDF: la cabecera no cabe en el buffer."); return false; }
+  n += r2;
+  const uint32_t headerLen = (uint32_t)n; // los pixeles empiezan en este desplazamiento del PDF
+
+  // --- Pie: fin del stream, tabla xref (cada entrada de 20 bytes exactos) y trailer
+  static const char ENDSTREAM[] = "\nendstream\nendobj\n";
+  const uint32_t xrefOff = headerLen + pixBytes + (uint32_t)(sizeof(ENDSTREAM) - 1);
+  char tail[448];
+  int t = snprintf(tail, sizeof(tail), "%sxref\n0 6\n0000000000 65535 f \n", ENDSTREAM);
+  for (int i = 1; i <= 5; i++) t += snprintf(tail + t, sizeof(tail) - (size_t)t, "%010lu 00000 n \n", (unsigned long)objOff[i]);
+  t += snprintf(tail + t, sizeof(tail) - (size_t)t, "trailer\n<< /Size 6 /Root 1 0 R >>\nstartxref\n%lu\n%%%%EOF\n", (unsigned long)xrefOff);
+  if (t <= 0 || (size_t)t >= sizeof(tail)) { Serial.println("[ERROR] PDF: el pie no cabe en el buffer."); return false; }
+
+  // --- Escritura secuencial: cabecera + pixeles + pie
+  uint32_t t0 = millis();
+  File pdf = SD.open(pdfName, "w");
+  if (!pdf) { Serial.printf("[ERROR] No se pudo crear %s en la SD\n", pdfName); return false; }
+  bool ok = (pdf.write((const uint8_t *)h, headerLen) == headerLen);
+  if (ok && cacheCoversPage()) {
+    // Camino rapido: de la cache PSRAM (cabecera BMP + pixeles) a la SD, sin tocar el BMP
+    const uint8_t *src = bmpCacheBuffer + BMP_HEADER_BYTES;
+    uint32_t left = pixBytes;
+    while (ok && left > 0) {
+      uint32_t c = (left < PDF_COPY_CHUNK_BYTES) ? left : (uint32_t)PDF_COPY_CHUNK_BYTES;
+      ok = (pdf.write(src, c) == c);
+      src += c; left -= c;
+    }
+  } else if (ok) {
+    // Sin cache: se releen los pixeles del BMP (ya volcado por completo). whiteChunk solo se usa
+    // al crear la hoja (y alli se rellena antes de cada uso), asi que sirve de buffer de copia.
+    pageFile.seek(BMP_HEADER_BYTES);
+    uint32_t left = pixBytes;
+    while (ok && left > 0) {
+      uint32_t c = (left < sizeof(whiteChunk)) ? left : (uint32_t)sizeof(whiteChunk);
+      ok = ((uint32_t)pageFile.read(whiteChunk, c) == c) && (pdf.write(whiteChunk, c) == c);
+      left -= c;
+    }
+    lastRowWritten = -2; // el puntero del BMP se ha movido
+  }
+  if (ok) ok = (pdf.write((const uint8_t *)tail, (size_t)t) == (size_t)t);
+  pdf.close();
+  if (!ok) {
+    SD.remove(pdfName); // no dejar un PDF truncado
+    Serial.printf("[ERROR] Fallo al escribir %s (SD llena o error): borrado\n", pdfName);
+    return false;
+  }
+  Serial.printf("[INFO] PDF creado: %s (%lu bytes, %lu ms)\n", pdfName,
+                (unsigned long)(headerLen + pixBytes + (uint32_t)t), (unsigned long)(millis() - t0));
+  return true;
+}
+
 // Abre una pagina nueva en el sentido LOGICO (posicion, buffer de bandas en blanco...). No toca la
 // SD: el fichero se crea al primer punto con tinta (materializePage()).
 void openNewPage() {
@@ -734,6 +868,7 @@ void closePage() {
     // ventana que sigan sin volcar.
     for (int32_t y = bandBase; y < bandBase + BAND_HEIGHT; y++) writeBackRow(y);
     pageFile.flush();
+    writePagePdf(); // PDF de la hoja junto al BMP (mismo nombre, .PDF); si falla, el BMP queda igual
     pageFile.close();
     sdWriteEnd();
     Serial.printf("[INFO] Pagina cerrada: %s (%lu filas)\n", currentFileName, (unsigned long)PAGE_HEIGHT_DOTS);
