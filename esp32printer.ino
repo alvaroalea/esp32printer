@@ -173,7 +173,16 @@ bool     autoCrOnLf       = true;   // LF (0x0A) tambien vuelve al margen izquie
 // poner autoLfOnCr en true; si en cambio el texto no vuelve al margen izquierdo entre lineas, prueba autoCrOnLf.
 #define IPP_URL_MAX_LEN 200 
 char ippUrl[IPP_URL_MAX_LEN + 1] = ""; // Direccion de la impresora del boton Print de /list: socket://IP[:puerto] (9100 por defecto), PWG raster por socket crudo; ver printPageRaster() en wifi_web.ino.
-bool     autoIPPPrint     = false;     // (para uso futuro) habilita la impresion via IPP de la pagina finalizada.
+bool     autoIPPPrint     = false;     // true = al cerrar una hoja con tinta se envia sola a la impresora de ippUrl (PWG raster, igual que el boton Print); ver autoPrintEnqueue().
+
+// Cola de hojas pendientes de impresion automatica. La llena closePage() (nucleo 1, un unico productor) y la
+// vacia la tarea WiFi (nucleo 0, un unico consumidor, ver processAutoPrintQueue() en wifi_web.ino): enviar la
+// hoja por TCP tarda segundos y asi nunca se retrasa la recepcion serie. Productor y consumidor solo escriben
+// su propio indice, asi que no hace falta mutex.
+#define AUTOPRINT_QUEUE_LEN 8
+static char autoPrintQueue[AUTOPRINT_QUEUE_LEN][32]; // nombres de fichero, p.ej. "/PAGE0007.BMP"
+static volatile uint8_t autoPrintHead = 0;           // proxima posicion a escribir (solo closePage())
+static volatile uint8_t autoPrintTail = 0;           // proxima posicion a leer (solo la tarea WiFi)
 
 
 // --- Geometria de la pagina virtual (rejilla interna a 180 dpi) ---
@@ -857,6 +866,19 @@ void openNewPage() {
   pageOpen = true;
 }
 
+// Encola la hoja 'bmpName' (ya cerrada) para imprimirla sola si autoIPPPrint esta activado y hay impresora
+// configurada. NO envia nada: lo hace la tarea WiFi. Solo se llama desde closePage() (nucleo 1).
+void autoPrintEnqueue(const char *bmpName) {
+  if (!autoIPPPrint || !ippUrl[0]) return;
+  uint8_t next = (uint8_t)((autoPrintHead + 1) % AUTOPRINT_QUEUE_LEN);
+  if (next == autoPrintTail) { // cola llena (la impresora no responde o va muy lenta): la hoja queda en la SD
+    Serial.printf("[AUTOPRINT] Cola llena: %s no se imprime sola (usa Print en /list)\n", bmpName);
+    return;
+  }
+  strlcpy(autoPrintQueue[autoPrintHead], bmpName, sizeof(autoPrintQueue[0]));
+  autoPrintHead = next; // se publica DESPUES de copiar el nombre
+}
+
 void closePage() {
   if (!pageOpen) return;
 
@@ -872,6 +894,7 @@ void closePage() {
     pageFile.close();
     sdWriteEnd();
     Serial.printf("[INFO] Pagina cerrada: %s (%lu filas)\n", currentFileName, (unsigned long)PAGE_HEIGHT_DOTS);
+    autoPrintEnqueue(currentFileName); // impresion automatica de la hoja ya cerrada (si autoIPPPrint)
   }
   pageOpen = false;
   pageFileCreated = false;

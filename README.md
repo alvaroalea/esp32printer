@@ -20,6 +20,16 @@ by default is configured for a Sinclair QL Computer, 9600 bauds, 8N1 with Automa
 ## font folder
 There are some small helpers written on python to convert and edit zx spectrum 768 bytes to font for printer, I use some ones from https://github.com/ZXSpectrumVault/zx-fonts to the diferents supported fonts.
 
+I use this:
+* courier - A Fistful of Blood Capsules (1987)(Zodiac Software)[end]#37966.ch8
+* prestige - A Fistful of Blood Capsules (1987)(Zodiac Software)(Part 1 of 3)#37966.ch8
+* roman - Fall of Rome, The (1984)(ASP Software)#56501.ch8
+* script - Damned Forest, The (1988)(Cult Games)#64000.ch8
+* OCR-A - Adventure F - The Eye of Bain (1984)(Artic Computing)#30263.ch8
+* OCR-B - Alcatraz Harry 2 - The Doomsday Mission (1984)(Scorpio Gamesworld)#62602.ch8
+
+
+
 ## Led Status
 the RGB led of the board indicate the state of the printer:
 
@@ -31,17 +41,15 @@ the RGB led of the board indicate the state of the printer:
 * YELLOW - FF Button has been pressed and page is being "explused"
 
 ## Future works:
-General TODO
-* Send the page (PDF) to a IPP printer automatically if configured for that.
 
-Printer Emulation
+Printer Emulation TODO
 * Proporcional font.
 * Real NLQ fonts.
 * Fonts loadables and in RAM.
 * Country Setings, and slashed 0.
 * User configurable fonts.
 
-Tests
+Tests TODO
 * Verify with Windows and Linux drivers.
 * Verify with BannerMania from MS-Dos.
 * Verify in other systems, ZX Spectrum, Amstrad, Enterprise.

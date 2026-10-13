@@ -119,6 +119,7 @@ void handleRoot() {
                 "img{max-width:95%;border:1px solid #555;margin-top:10px;background:#fff}"
                 "a{color:#8cf}</style></head><body>"
                 "<h2>Emulador Impresora ESC/P (ESP32)</h2>";
+  if (autoIPPPrint) html += "<p style='color:#f33'>[IMPRESION AUTOMATICA ACTIVA]</p>";
   if (pageOpen && pageFileCreated) {
     html += "<p>Imprimiendo ahora: " + String(currentFileName) + "</p>";
   } else if (pageIndex > 0) {
@@ -136,9 +137,7 @@ void handleRoot() {
   html += "<img id='pg' src='/current.bmp' onerror=\"this.style.display='none'\">"
           "<p><a href='/list'>Ver todas las paginas</a> &middot; "
           "<a href='/current.bmp'>Pagina Actual</a> &middot; "
-          "<a href='/config'>Configurar impresora</a> &middot; "
-          "<a href='/wifi-portal'>Cambiar red WiFi</a> &middot; "
-          "<a href='/wifi-reset'>Olvidar WiFi</a></p>"
+          "<a href='/config'>Configurar impresora</a></p>"
           "<script>setInterval(function(){"
           "document.getElementById('pg').style.display='';"
           "document.getElementById('pg').src='/current.bmp?' + Date.now();"
@@ -718,6 +717,33 @@ void handlePrint() {
   webServer.send(ok ? 200 : 502, "text/html", html);
 }
 
+// --- Impresion automatica (autoIPPPrint): vacia la cola que llena closePage() (ver autoPrintEnqueue()).
+// Corre en la tarea WiFi (nucleo 0), igual que /print, asi que la recepcion serie no se entera. Como
+// /print, bloquea esta tarea (y con ella el servidor web) mientras dura el envio de cada hoja. ---
+static void processAutoPrintQueue() {
+  while (autoPrintTail != autoPrintHead) {
+    char name[sizeof(autoPrintQueue[0])];
+    strlcpy(name, autoPrintQueue[autoPrintTail], sizeof(name));
+    autoPrintTail = (uint8_t)((autoPrintTail + 1) % AUTOPRINT_QUEUE_LEN); // libera el hueco ya copiado el nombre
+    if (!autoIPPPrint) { // se desactivo mientras esperaba: no se imprime
+      Serial.printf("[AUTOPRINT] Desactivado, se descarta %s\n", name);
+      continue;
+    }
+    bool exists;
+    sdAccessBegin();
+    exists = SD.exists(name);
+    sdAccessEnd();
+    if (!exists) { // borrada desde /list antes de que le tocara
+      Serial.printf("[AUTOPRINT] %s ya no existe, se descarta\n", name);
+      continue;
+    }
+    char msg[256];
+    Serial.printf("[AUTOPRINT] Enviando %s a la impresora...\n", name);
+    bool ok = printPageRaster(name, msg, sizeof(msg));
+    Serial.printf("[AUTOPRINT] %s: %s%s\n", name, ok ? "" : "ERROR: ", msg);
+  }
+}
+
 // --- Sirve cualquier .BMP o .PDF que exista en la SD por su nombre de fichero
 // (ej. /PAGE0007.BMP o /PAGE0007.PDF), que es a donde apuntan los enlaces de /list. Se
 // registra con onNotFound() porque esos nombres no se conocen de antemano
@@ -864,7 +890,7 @@ static void addPrinterParams(WiFiManager &wm) {
            "<br/><label><input type='checkbox' name='cfg_xonxoff' value='1'%s> Control de flujo por software (XON/XOFF)</label>"
            "<br/><label><input type='checkbox' name='cfg_autolf' value='1'%s> Auto LF: un CR tambien hace salto de linea</label>"
            "<br/><label><input type='checkbox' name='cfg_autocr' value='1'%s> Auto CR: un LF tambien vuelve al margen izquierdo</label>"
-           "<br/><label><input type='checkbox' name='cfg_autoprint' value='1'%s> Automatic print of complete page on configured IPP Printer</label>"
+           "<br/><label><input type='checkbox' name='cfg_autoprint' value='1'%s> Imprimir automaticamente al finalizar la pagina</label>"
            "<br/>",
            useHwFlowControl ? " checked" : "", useXonXoff ? " checked" : "",
            autoLfOnCr ? " checked" : "", autoCrOnLf ? " checked" : "", autoIPPPrint ? " checked" : "");
@@ -921,13 +947,14 @@ void handleConfig() {
                 "<label><input type='checkbox' name='cfg_xonxoff' value='1'" + (useXonXoff ? " checked" : "") + "> Control de flujo por software (XON/XOFF)</label>"
                 "<label><input type='checkbox' name='cfg_autolf' value='1'" + (autoLfOnCr ? " checked" : "") + "> Auto LF: un CR tambien hace salto de linea</label>"
                 "<label><input type='checkbox' name='cfg_autocr' value='1'" + (autoCrOnLf ? " checked" : "") + "> Auto CR: un LF tambien vuelve al margen izquierdo</label>"
-                "<label><input type='checkbox' name='cfg_autoprint' value='1'" + (autoIPPPrint ? " checked" : "") + "> Automatic print of complete page on configured IPP Printer</label>"
+                "<label><input type='checkbox' name='cfg_autoprint' value='1'" + (autoIPPPrint ? " checked" : "") + "> Imprimir automaticamente al finalizar la pagina</label>"
                 "<label>Impresora para Print: socket://IP[:puerto] (9100 por defecto)"
                 "<input type='text' name='cfg_ippurl' maxlength='" + String((int)IPP_URL_MAX_LEN) + "' placeholder='socket://192.168.1.70:9100' value='" + htmlEscape(ippUrl) + "'></label>"
                 "<p><button type='submit'>Guardar</button></p></form>"
                 "<p><small>Los cambios se guardan en la memoria flash y se aplican al momento: no hace falta reiniciar. "
                 "Para cambiar la <b>red WiFi</b> (SSID y contrase&ntilde;a) hay que usar el <a href='/wifi-portal'>portal de WiFi</a>, "
                 "que abre una red propia.</small></p>"
+                "<p><a href='/wifi-portal'>Cambiar red WiFi</a> &middot; <a href='/wifi-reset' onclick=\"return confirm('Se borrara la red WiFi guardada y la impresora se reiniciara. Continuar?')\">Olvidar WiFi</a></p>"
                 "<p><a href='/'>Inicio</a> &middot; <a href='/list'>Ver todas las paginas</a></p></body></html>";
   webServer.send(200, "text/html", html);
 }
@@ -1021,6 +1048,7 @@ void loopWifiOtaWeb() {
     configPortalRequested = false;
     runOnDemandConfigPortal();
   }
+  processAutoPrintQueue(); // hojas cerradas pendientes de enviar a la impresora (autoIPPPrint)
 }
 
 // --- Tarea de FreeRTOS: aqui es donde de verdad se evita el bloqueo ---
