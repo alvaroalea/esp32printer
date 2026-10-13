@@ -22,11 +22,12 @@
  *     Arduino buscando "WiFiManager" (autor: tzapu). ArduinoOTA y
  *     WebServer, en cambio, ya vienen incluidas en el propio nucleo ESP32
  *     de Arduino: no hace falta instalar nada mas para esas dos.
- *   - La pagina de configuracion del WiFi incluye ademas los AJUSTES DE LA
- *     IMPRESORA (baudios del puerto serie, control de flujo por hardware y por
- *     software, Auto LF / Auto CR y la direccion de la impresora). Se guardan en
- *     la memoria flash (Preferences) y se aplican al momento. Para cambiar solo
- *     eso, deja el SSID en blanco y pulsa Save: la red WiFi no se toca.
+ *   - Los AJUSTES DE LA IMPRESORA (baudios del puerto serie, control de flujo por
+ *     hardware y por software, Auto LF / Auto CR y la direccion de la impresora) se
+ *     cambian en http://<ip>/config, servida por el servidor web normal: sin
+ *     reiniciar y sin cambiar de red. Se guardan en la memoria flash (Preferences) y
+ *     se aplican al momento. Los mismos campos siguen estando tambien en el portal
+ *     del WiFi (deja el SSID en blanco y pulsa Save: la red no se toca).
  *   - OTA (ArduinoOTA): permite subir un nuevo firmware por WiFi desde el
  *     IDE de Arduino (Herramientas -> Puerto -> aparecera el ESP32 por
  *     red ademas de por USB) sin necesidad de cable. Protegido con
@@ -42,7 +43,10 @@
  *                      definitiva y fondo blanco), asi que es siempre un BMP
  *                      valido aunque la pagina no se haya terminado de
  *                      imprimir todavia (ver materializePage())
- *       /config        abre a peticion la pagina de configuracion del WiFi
+ *       /config        ajustes de la impresora (baudios, control de flujo, Auto
+ *                      LF/CR, direccion de la impresora): formulario servido
+ *                      por este mismo servidor, se aplican al momento
+ *       /wifi-portal   abre a peticion el portal de configuracion del WiFi
  *                      (la misma del primer arranque) sin borrar la red
  *                      guardada: sirve para cambiar los ajustes de la impresora
  *       /list          lista de todos los PAGEnnnn.BMP que hay en la SD, cada
@@ -133,7 +137,8 @@ void handleRoot() {
           "<p><a href='/list'>Ver todas las paginas</a> &middot; "
           "<a href='/current.bmp'>Pagina Actual</a> &middot; "
           "<a href='/config'>Configurar impresora</a> &middot; "
-          "<a href='/wifi-reset'>Reconfigurar WiFi</a></p>"
+          "<a href='/wifi-portal'>Cambiar red WiFi</a> &middot; "
+          "<a href='/wifi-reset'>Olvidar WiFi</a></p>"
           "<script>setInterval(function(){"
           "document.getElementById('pg').style.display='';"
           "document.getElementById('pg').src='/current.bmp?' + Date.now();"
@@ -364,7 +369,7 @@ void handleDelete() {
 // marca "RaS2" + una pagina: cabecera de 1796 bytes (formato cups_page_header2_t, enteros en
 // big-endian; los mismos campos que escribe cupsRasterInitPWGHeader) + las filas comprimidas
 // con el PackBits propio de PWG. La pagina es sRGB de 8 bits (24 bits/pixel): cada indice del BMP
-// se convierte a RGB con la tabla de color del PROPIO BMP, asi que no depende de paleta_ryb.h.
+// se convierte a RGB con la tabla de color del PROPIO BMP, asi que no depende de paleta_cmyk.h.
 //
 // GEOMETRIA (ajustable aqui): hoja PWG_PAGE_W_MM x PWG_PAGE_H_MM a PWG_DPI. La imagen se escala
 // al ancho de la hoja menos dos margenes de PWG_SIDE_MARGIN_MM (mismo criterio que el PDF), por
@@ -777,7 +782,7 @@ static char cfgBaudStr[12];
 static WiFiManagerParameter *pBaud = nullptr; // campo de baudios
 static WiFiManagerParameter *pIpp = nullptr;  // campo de la URL IPP
 static WiFiManager *gPortalWm = nullptr;      // el WiFiManager que tiene el portal abierto (para leer las casillas)
-volatile bool configPortalRequested = false;  // /config pide abrir el portal; lo abre loopWifiOtaWeb() en esta misma tarea
+volatile bool configPortalRequested = false;  // /wifi-portal pide abrir el portal; lo abre loopWifiOtaWeb() en esta misma tarea
 
 // Quita espacios de los extremos y los caracteres que romperian el HTML del formulario cuando
 // el valor se vuelve a escribir en value='...' (comillas y < >).
@@ -789,47 +794,66 @@ static void sanitizeUrl(char *url) {
   *dst = 0;
 }
 
-// Callback de WiFiManager: se llama al pulsar Save, DESPUES de copiar los campos a sus parametros.
-static void onSavePrinterParams() {
-  if (!gPortalWm || !pBaud || !pIpp) return;
+// ===== AJUSTES DE LA IMPRESORA: LOGICA COMPARTIDA (portal de WiFiManager y pagina /config) BEGIN =====
+// Valida y aplica los ajustes, los guarda en la memoria flash y, si cambian los baudios o el control
+// de flujo, pide a loop() (el nucleo que usa Serial2) que los re-aplique al puerto serie. Devuelve los
+// avisos en texto plano, uno por linea, o "" si todo fue bien. Un valor no valido (baudios, direccion
+// de la impresora) no impide guardar el resto: los baudios no validos se ignoran y la direccion no
+// valida se guarda tal cual con un aviso.
+static String applyPrinterSettings(const char *baudStr, bool hw, bool xon, bool autoLf, bool autoCr,
+                                   bool autoPrint, const char *url, const char *origin) {
+  String warn;
   bool serialChanged = false;
 
   // Baudios: solo si el valor es un numero valido; si no, se mantiene el actual.
   char *endp = nullptr;
-  uint32_t b = strtoul(pBaud->getValue(), &endp, 10);
-  if (pBaud->getValue()[0] != 0 && *endp == 0 && validBaud(b)) {
+  uint32_t b = strtoul(baudStr, &endp, 10);
+  if (baudStr[0] != 0 && *endp == 0 && validBaud(b)) {
     if (b != serialBaud) serialChanged = true;
     serialBaud = b;
   } else {
-    Serial.printf("[CONFIG] Baudios no validos ('%s'; se admite 300-1000000): se mantiene %lu\n",
-                  pBaud->getValue(), (unsigned long)serialBaud);
+    Serial.printf("[CONFIG] Baudios no validos ('%s'; se admite 300-1000000): se mantiene %lu\n", baudStr, (unsigned long)serialBaud);
+    warn += "Baudios no validos ('" + String(baudStr) + "'; se admite 300-1000000): se mantiene " + String((unsigned long)serialBaud) + "\n";
   }
 
-  // Casillas de verificacion: marcada = el navegador envia el campo; desmarcada = no llega.
-  bool hw = gPortalWm->server->hasArg("cfg_hwflow");
   if (hw != useHwFlowControl) serialChanged = true;
   useHwFlowControl = hw;
-  useXonXoff = gPortalWm->server->hasArg("cfg_xonxoff");
-  autoLfOnCr = gPortalWm->server->hasArg("cfg_autolf");
-  autoCrOnLf = gPortalWm->server->hasArg("cfg_autocr");
-  autoIPPPrint = gPortalWm->server->hasArg("cfg_autoprint");
+  useXonXoff = xon;
+  autoLfOnCr = autoLf;
+  autoCrOnLf = autoCr;
+  autoIPPPrint = autoPrint;
 
   // Direccion de la impresora para el boton Print (socket crudo, puerto 9100 por defecto).
-  strncpy(ippUrl, pIpp->getValue(), IPP_URL_MAX_LEN);
+  strncpy(ippUrl, url, IPP_URL_MAX_LEN);
   ippUrl[IPP_URL_MAX_LEN] = 0;
   sanitizeUrl(ippUrl);
   {
     char hostChk[80]; uint16_t portChk;
     if (ippUrl[0] && !parsePrinterUrl(ippUrl, hostChk, sizeof(hostChk), &portChk)) {
       Serial.println("[CONFIG] AVISO: la direccion de la impresora no es valida (ej. socket://192.168.1.70:9100); se guarda igualmente.");
+      warn += "La direccion de la impresora no es valida (ej. socket://192.168.1.70:9100); se ha guardado igualmente.\n";
     }
   }
 
-  if (saveConfig()) printConfig("Configuracion guardada desde la pagina de configuracion del WiFi:");
+  if (saveConfig()) printConfig(origin);
+  else warn += "No se pudo guardar en la memoria flash: los ajustes valen hasta el proximo reinicio.\n";
   if (serialChanged) {
-    serialConfigDirty = true; // loop() (el nucleo que usa Serial2) re-aplica baudios y control de flujo
+    serialConfigDirty = true; // loop() re-aplica baudios y control de flujo
     Serial.println("[CONFIG] Baudios / control de flujo cambiados: se re-aplican ahora al puerto serie.");
   }
+  return warn;
+}
+// ===== AJUSTES DE LA IMPRESORA: LOGICA COMPARTIDA END =====
+
+// Callback de WiFiManager: se llama al pulsar Save, DESPUES de copiar los campos a sus parametros.
+static void onSavePrinterParams() {
+  if (!gPortalWm || !pBaud || !pIpp) return;
+  // Casillas de verificacion: marcada = el navegador envia el campo; desmarcada = no llega.
+  applyPrinterSettings(pBaud->getValue(),
+                       gPortalWm->server->hasArg("cfg_hwflow"), gPortalWm->server->hasArg("cfg_xonxoff"),
+                       gPortalWm->server->hasArg("cfg_autolf"), gPortalWm->server->hasArg("cfg_autocr"),
+                       gPortalWm->server->hasArg("cfg_autoprint"), pIpp->getValue(),
+                       "Configuracion guardada desde la pagina de configuracion del WiFi:");
 }
 
 // Anade al portal los campos de la impresora, con los valores ACTUALES como valores por defecto.
@@ -864,24 +888,70 @@ static void addPrinterParams(WiFiManager &wm) {
   wm.setSaveParamsCallback(onSavePrinterParams);
 }
 
-// --- /config: abre a peticion la pagina de configuracion del WiFi (con los ajustes de la impresora) ---
+// --- /config: AJUSTES DE LA IMPRESORA, servidos por el servidor web normal (puerto 80, la misma red) ---
+// GET muestra el formulario con los valores actuales; POST los aplica y guarda (sin reiniciar ni cambiar
+// de red; los baudios y el control de flujo se re-aplican al puerto serie al momento) y vuelve a mostrar
+// el formulario con el resultado. Los campos se llaman igual que en el portal de WiFiManager.
+void handleConfig() {
+  String notice;
+  if (webServer.method() == HTTP_POST) {
+    String warn = applyPrinterSettings(webServer.arg("cfg_baud").c_str(),
+                                       webServer.hasArg("cfg_hwflow"), webServer.hasArg("cfg_xonxoff"),
+                                       webServer.hasArg("cfg_autolf"), webServer.hasArg("cfg_autocr"),
+                                       webServer.hasArg("cfg_autoprint"), webServer.arg("cfg_ippurl").c_str(),
+                                       "Configuracion guardada desde la pagina /config del servidor web:");
+    if (warn.length() == 0) {
+      notice = "<p class='ok'>&#10004; Configuracion guardada y aplicada.</p>";
+    } else {
+      String w = htmlEscape(warn.c_str());
+      w.replace("\n", "<br>");
+      notice = "<p class='warn'>&#9888; Configuracion guardada, con avisos:<br>" + w + "</p>";
+    }
+  }
+  String html = "<!DOCTYPE html><html><head><meta charset='utf-8'><title>Configurar impresora</title>"
+                "<meta name='viewport' content='width=device-width, initial-scale=1'>"
+                "<style>body{font-family:sans-serif;max-width:34em;margin:1em auto;padding:0 1em}"
+                "label{display:block;margin:.5em 0}input[type=text],input[type=number]{width:100%;box-sizing:border-box;padding:.3em}"
+                ".ok{color:#070}.warn{color:#a50}small{color:#555}</style></head><body>"
+                "<h2>Ajustes de la impresora</h2>" + notice +
+                "<form method='POST' action='/config'>"
+                "<label>Baudios del puerto serie (300-1000000)"
+                "<input type='number' name='cfg_baud' min='300' max='1000000' value='" + String((unsigned long)serialBaud) + "'></label>"
+                "<label><input type='checkbox' name='cfg_hwflow' value='1'" + (useHwFlowControl ? " checked" : "") + "> Control de flujo por hardware (RTS/CTS)</label>"
+                "<label><input type='checkbox' name='cfg_xonxoff' value='1'" + (useXonXoff ? " checked" : "") + "> Control de flujo por software (XON/XOFF)</label>"
+                "<label><input type='checkbox' name='cfg_autolf' value='1'" + (autoLfOnCr ? " checked" : "") + "> Auto LF: un CR tambien hace salto de linea</label>"
+                "<label><input type='checkbox' name='cfg_autocr' value='1'" + (autoCrOnLf ? " checked" : "") + "> Auto CR: un LF tambien vuelve al margen izquierdo</label>"
+                "<label><input type='checkbox' name='cfg_autoprint' value='1'" + (autoIPPPrint ? " checked" : "") + "> Automatic print of complete page on configured IPP Printer</label>"
+                "<label>Impresora para Print: socket://IP[:puerto] (9100 por defecto)"
+                "<input type='text' name='cfg_ippurl' maxlength='" + String((int)IPP_URL_MAX_LEN) + "' placeholder='socket://192.168.1.70:9100' value='" + htmlEscape(ippUrl) + "'></label>"
+                "<p><button type='submit'>Guardar</button></p></form>"
+                "<p><small>Los cambios se guardan en la memoria flash y se aplican al momento: no hace falta reiniciar. "
+                "Para cambiar la <b>red WiFi</b> (SSID y contrase&ntilde;a) hay que usar el <a href='/wifi-portal'>portal de WiFi</a>, "
+                "que abre una red propia.</small></p>"
+                "<p><a href='/'>Inicio</a> &middot; <a href='/list'>Ver todas las paginas</a></p></body></html>";
+  webServer.send(200, "text/html", html);
+}
+
+// --- /wifi-portal: abre a peticion el portal de WiFiManager para cambiar la RED WiFi (SSID y contrasena) ---
 // El portal se monta en la tarea WiFi (nucleo 0), no en el manejador HTTP: lo abre loopWifiOtaWeb().
+// Aqui si hace falta conectarse a la red propia del ESP32 (el cambio de red no se puede hacer desde la red vieja).
 void handleConfigPortal() {
   webServer.send(200, "text/html",
-    "<!DOCTYPE html><html><head><meta charset='utf-8'><title>Configurar</title></head><body>"
-    "<h2>Abriendo la pagina de configuracion</h2>"
+    "<!DOCTYPE html><html><head><meta charset='utf-8'><title>Cambiar red WiFi</title></head><body>"
+    "<h2>Abriendo el portal de configuracion del WiFi</h2>"
     "<p>En unos segundos esta pagina dejara de responder. Conecta el movil u ordenador a la red WiFi "
     "<b>" WIFI_CONFIG_AP_NAME "</b> y abre <b>http://192.168.4.1</b> (se abre sola en la mayoria de los "
     "casos) &rarr; <i>Configure WiFi</i>.</p>"
-    "<p>Para cambiar <b>solo los ajustes de la impresora</b>, deja el SSID en blanco y pulsa <i>Save</i>: "
-    "la red WiFi no se toca. El portal se cierra solo a los 3 minutos o con <i>Exit</i>.</p>"
+    "<p>Elige la nueva red y su contrase&ntilde;a y pulsa <i>Save</i>. Si no quieres cambiar de red, "
+    "pulsa <i>Exit</i>: el portal tambien se cierra solo a los 3 minutos. (Los ajustes de la impresora ya "
+    "no hace falta cambiarlos aqui: estan en <b>/config</b>.)</p>"
     "</body></html>");
   configPortalRequested = true;
 }
 
 static void runOnDemandConfigPortal() {
   Serial.println("[WIFI] Abriendo a peticion la pagina de configuracion (AP \"" WIFI_CONFIG_AP_NAME "\")...");
-  delay(600);          // dejar que el navegador reciba la respuesta de /config antes de cerrar el servidor
+  delay(600);          // dejar que el navegador reciba la respuesta de /wifi-portal antes de cerrar el servidor
   webServer.stop();    // el portal de WiFiManager necesita el puerto 80
   {
     WiFiManager wm;
@@ -936,7 +1006,8 @@ void setupWifiOtaWeb() {
   webServer.on("/list", handleList);
   webServer.on("/print", HTTP_POST, handlePrint); // solo POST: imprime la hoja (PWG raster, socket crudo)
   webServer.on("/delete", HTTP_POST, handleDelete); // solo POST: un GET a /delete cae en onNotFound (404), nunca borra
-  webServer.on("/config", handleConfigPortal);
+  webServer.on("/config", handleConfig);              // ajustes de la impresora (GET formulario, POST guardar)
+  webServer.on("/wifi-portal", handleConfigPortal);   // abre el portal de WiFiManager (cambiar de red WiFi)
   webServer.on("/wifi-reset", handleWifiReset);
   webServer.onNotFound(handlePossibleBmpFile); // sirve /PAGEnnnn.BMP y .PDF (enlaces de /list)
   webServer.begin();

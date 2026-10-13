@@ -10,7 +10,7 @@
  * Interpreta texto y graficos de puntos, los "pinta" en un lienzo virtual
  * y, cada vez que llega un salto de pagina (Form Feed) o pasan unos segundos
  * sin actividad, vuelca la pagina completa a un fichero BMP indexado de 8
- * bits (paleta de 256 colores RYBK para varias pasadas, ver paleta_ryb.h;
+ * bits (paleta de 256 colores CMYK para varias pasadas, ver paleta_cmyk.h;
  * formato BI_RGB sin comprimir) en la SD.
  *
  * ---------------------------------------------------------------------
@@ -110,7 +110,7 @@
 #include <WiFi.h>
 #include <WiFiManager.h>   // libreria de terceros: "WiFiManager" de tzapu, se incluye aqui para evitar errores de compilacion.
 #include "font5x7.h"
-#include "paleta_ryb.h" // paleta de 256 colores RYBK para varias pasadas (ver su cabecera)
+#include "paleta_cmyk.h" // paleta de 256 colores CMYK para varias pasadas (ver su cabecera)
 #ifndef IADEVEL
 #include "font8x8.h"
 #include "roman.h"
@@ -236,7 +236,7 @@ static void addPrinterParams(WiFiManager &wm); // pero aqui evita el error de co
 
 
 // ================================ PALETA DE COLOR ==========================
-// Colores: ver paleta_ryb.h (cinta Rojo/Amarillo/Azul/Negro, varias pasadas, 256 colores).
+// Colores: ver paleta_cmyk.h (cinta Cian/Magenta/Amarillo/Negro, varias pasadas, 256 colores).
 
 struct FontChoice { const uint8_t *data; uint8_t cols; uint8_t rows; uint8_t firstChar; uint8_t lastChar; uint8_t baseScaleY; };
 struct GfxMode { uint8_t pins; uint16_t dpi; }; // ver el comentario de FontChoice: debe ir aqui, antes de cualquier funcion
@@ -255,11 +255,11 @@ struct LineChar {
 };
 
 
-#define COLOR_WHITE_INDEX RYBK_WHITE_INDEX // "sin tinta" = papel blanco = indice 0 de la paleta RYBK: el indice de
+#define COLOR_WHITE_INDEX CMYK_WHITE_INDEX // "sin tinta" = papel blanco = indice 0 de la paleta CMYK: el indice de
                                            // band[] es directamente el indice de paleta que se guarda en el fichero
 
 // --- Formato de fichero: BMP INDEXADO de 8 bits (1 byte por pixel) con la
-// paleta de 256 entradas de paleta_ryb.h: el indice es un mapa de bits de
+// paleta de 256 entradas de paleta_cmyk.h: el indice es un mapa de bits de
 // tinta (nibble bajo = 1a pasada, nibble alto = 2a) para sumar colores al
 // imprimir varias veces sobre el mismo punto. El indice de band[] se escribe
 // tal cual en el fichero (sin empaquetar). Cada pagina ocupa ~2.8MB.
@@ -279,7 +279,7 @@ int32_t cursorY = 0;            // posicion vertical actual dentro de la pagina,
 int32_t leftMarginDots = 0;                 // ESC l n : margen izquierdo en puntos (ya convertido con el CPI de ese momento)
 int32_t rightMarginDots = PAGE_WIDTH_DOTS;  // ESC Q n : margen derecho en puntos, medido desde el borde izquierdo
 int32_t lineSpacingDots = DEFAULT_LINE_DOTS;
-uint8_t currentColor = 0;       // numero de color de ESC r (0..6; ver RYBK_ESC_R_MASK en paleta_ryb.h), por defecto negro
+uint8_t currentColor = 0;       // numero de color de ESC r (0..6; ver CMYK_ESC_R_MASK en paleta_cmyk.h), por defecto negro
 bool boldMode = false;
 bool underlineMode = false;
 bool overscoreMode = false;     // ESC _ n : linea sobre la primera fila del caracter
@@ -620,11 +620,11 @@ bool materializePage() {
   header[42] = 0x12; header[43] = 0x0B; // idem, Y
   // bytes 46..49 (colores en la paleta) y 50..53 (colores importantes) a 0 = "el maximo
   // del bit depth" (256), convencion estandar.
-  // Tabla de color (256 entradas x 4 bytes BGR0): los 256 colores de paleta_ryb.h (rybkColor).
+  // Tabla de color (256 entradas x 4 bytes BGR0): los 256 colores de paleta_cmyk.h (cmykColor).
   for (int i = 0; i < BMP_PALETTE_COLORS; i++) {
     uint8_t *entry = &header[54 + i * 4];
     uint8_t r, g, b;
-    rybkColor((uint8_t)i, &r, &g, &b);
+    cmykColor((uint8_t)i, &r, &g, &b);
     entry[0] = b; entry[1] = g; entry[2] = r; entry[3] = 0;
   }
   pageFile.write(header, BMP_HEADER_BYTES);
@@ -685,7 +685,7 @@ void beginPassMask(int32_t x0, int32_t y0, int32_t w, int32_t h) {
 void endPassMask() { passActive = false; }
 
 // Pinta un punto con el color de ESC r 'colorIndex' (0..6), SUMANDO las tintas a lo que ya hubiera
-// en el pixel (paleta_ryb.h, rybkPaint): 1a pasada -> nibble bajo, 2a -> nibble alto.
+// en el pixel (paleta_cmyk.h, cmykPaint): 1a pasada -> nibble bajo, 2a -> nibble alto.
 void plotDot(int32_t x, int32_t y, uint8_t colorIndex) {
   if (x < 0 || x >= PAGE_WIDTH_DOTS || y < 0 || y >= PAGE_HEIGHT_DOTS) return;
   if (passActive && x >= passX0 && x < passX0 + passW && y >= passY0 && y < passY0 + passH) {
@@ -696,8 +696,8 @@ void plotDot(int32_t x, int32_t y, uint8_t colorIndex) {
   if (!pageFileCreated && !materializePage()) return; // primer punto con tinta: se crea el fichero
   ensureBandCovers(y);
   int32_t rel = y % BAND_HEIGHT; // buffer en anillo: mismo indexado que usan writeBackRow()/loadRow()
-  uint8_t inkMask = (colorIndex <= 6) ? RYBK_ESC_R_MASK[colorIndex] : (uint8_t)INK_K;
-  band[rel][x] = rybkPaint(band[rel][x], inkMask);
+  uint8_t inkMask = (colorIndex <= 6) ? CMYK_ESC_R_MASK[colorIndex] : (uint8_t)INK_K;
+  band[rel][x] = cmykPaint(band[rel][x], inkMask);
   bandDirty[rel] = 1;
   pageHasInk = true;
   if (y > maxYUsed) maxYUsed = y;
@@ -710,7 +710,7 @@ void plotDot(int32_t x, int32_t y, uint8_t colorIndex) {
 // en una hoja A4 con margenes laterales de PDF_SIDE_MARGIN_MM. Pensado para mandarlo luego tal
 // cual a una impresora por IPP, y para ser lo mas barato posible de generar:
 //  - SIN compresion: la imagen es un XObject de 8 bits con espacio de color /Indexed /DeviceRGB
-//    (la paleta de 256 colores de paleta_ryb.h, en hexadecimal dentro del propio PDF) y SIN /Filter.
+//    (la paleta de 256 colores de paleta_cmyk.h, en hexadecimal dentro del propio PDF) y SIN /Filter.
 //    Los datos del stream son EXACTAMENTE los pixeles del BMP: el BMP es de arriba a abajo (alto
 //    negativo), 1 byte por pixel y fila = PAGE_WIDTH_DOTS bytes (multiplo de 4, sin relleno), que
 //    es justo el orden y el formato que espera PDF. Es una copia de bytes, sin convertir nada.
@@ -780,7 +780,7 @@ bool writePagePdf() {
   static const char hexDigits[] = "0123456789ABCDEF";
   for (int i = 0; i < BMP_PALETTE_COLORS; i++) {
     uint8_t r, g, b;
-    rybkColor((uint8_t)i, &r, &g, &b);
+    cmykColor((uint8_t)i, &r, &g, &b);
     h[n++] = hexDigits[r >> 4]; h[n++] = hexDigits[r & 15];
     h[n++] = hexDigits[g >> 4]; h[n++] = hexDigits[g & 15];
     h[n++] = hexDigits[b >> 4]; h[n++] = hexDigits[b & 15];
