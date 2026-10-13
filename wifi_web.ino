@@ -300,7 +300,7 @@ void handleList() {
           // [pdf]: descarga del PDF de la hoja (PAGEnnnn.PDF), solo si existe. Los PDF no se listan aparte.
           String pdfName = bare.substring(0, 8) + ".PDF";
           if (SD.exists(("/" + pdfName).c_str())) {
-            html += " <a class='pdf' href='/" + pdfName + "' download='" + pdfName + "' title='Descargar el PDF de la hoja'>[pdf]</a>";
+            html += " <a class='pdf' href='/" + pdfName + "' download='" + pdfName + "' title='Descargar el PDF de la hoja'>pdf</a>";
           }
           // Print: imprime la hoja (PWG raster por socket crudo, a la direccion ippUrl). POST + confirmacion, como Borrar (gasta papel).
           html += " <form method='POST' action='/print' style='display:inline' "
