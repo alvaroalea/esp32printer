@@ -33,7 +33,6 @@ the RGB led of the board indicate the state of the printer:
 ## Future works:
 General TODO
 * Send the page (PDF) to a IPP printer automatically if configured for that.
-* made Configurable settings via web without restart wifi.
 
 Printer Emulation
 * Proporcional font.
@@ -41,7 +40,6 @@ Printer Emulation
 * Fonts loadables and in RAM.
 * Country Setings, and slashed 0.
 * User configurable fonts.
-* Verify if ribbon (ink) is BYRK, or CYMK.
 
 Tests
 * Verify with Windows and Linux drivers.
