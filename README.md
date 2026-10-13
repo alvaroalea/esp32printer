@@ -9,13 +9,19 @@ check the #defines at esp32printer.ino for the pinouts.
 It provide a secondary serial port, including hardware handshake that emulate
 a needle's colour printer type epson, as it accept a subset of the esc/p escape sequences.
 
-it generate a .bmp for each A4 size sheet printed.
+It generate a .bmp and a .pdf files for each A4 size sheet printed.
 
-It's also provide a web server, so can be reached by wifi and printed in a moderm printer using a modern computer and webbrowser.
+Optionally the bmp file can be send to a network printer conected to the same wifi,
+the printer need to be compatible with IPP Printing Everywhere, that is almost all of todays printers.
+
+It's also provide a web server, it provide several functionality:
+* you can see the ongoing page being printed
+* you can configure the options of the printer and the IP address of the real printer.
+* you can manage de sd card, see previous .bmp prints, download the .pdf version, send to a printer and delete it.
 
 Still in development, only basic work.
 
-by default is configured for a Sinclair QL Computer, 9600 bauds, 8N1 with Automatic CR on each LF configured, this can be changed by #defines in the code.
+by default is configured for a Sinclair QL Computer, 9600 bauds, 8N1 with Automatic CR on each LF configured, this can be changed on the configuration page.
 
 ## font folder
 There are some small helpers written on python to convert and edit zx spectrum 768 bytes to font for printer, I use some ones from https://github.com/ZXSpectrumVault/zx-fonts to the diferents supported fonts.
@@ -48,13 +54,27 @@ Printer Emulation TODO
 * Fonts loadables and in RAM.
 * Country Setings, and slashed 0.
 * User configurable fonts.
+* configurable page side
+* configurable nº of bit, parity and bit stop.
 
 Tests TODO
 * Verify with Windows and Linux drivers.
 * Verify with BannerMania from MS-Dos.
 * Verify in other systems, ZX Spectrum, Amstrad, Enterprise.
 
+Other TODO
+* Provide a configurable hostname
+* be able to search other hostnames not only by IP
+* Search and list available printers
+
 ## Actual Status
+* Configurable Serial port and operation
+* Support all text stiles from ESC/P
+* Support for color selection
+* Generate a .bmp and a .pdf file when page is complete
+* Send page to a IPP Print Everywhere Printer (manual and automaticaly)
+* Limited file management
+
 These are examples of supported features:
 
 Star LC 10 Colour basic demo from manual:
